@@ -1175,20 +1175,35 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
                           max_length=prompt_len).input_ids
     return (input_ids[0],) * num_prompts
 
+def get_file_inputs(fname, tokenizer):
+    if fname.endswith(".txt"):
+        prompt = open(fname).read()
+        prompts = [ prompt ]
+    elif fname.endswith(".json"):
+        import json
+        prompts = json.load(open(fname))
+        prompts = [ p["prompt"] for p in prompts ]  
 
+    return prompts
+
+    
+   
 def run_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
     if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
     else:
-        model_path = os.path.join(os.path.expanduser("~/inference/model"), args.model)
-        tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
 
     # Task and policy
-    warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
-    inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
+    
+    # warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
+    file_inputs = get_file_inputs(1, num_prompts, tokenizer)
+    input_in_tokens, = tokenizer(file_inputs, padding="longest")
+    
+    # inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
@@ -1222,12 +1237,12 @@ def run_flexllmgen(args):
     try:
         print("warmup - generate")
         output_ids = model.generate(
-            warmup_inputs, max_new_tokens=1, verbose=args.verbose)
+            input_in_tokens, max_new_tokens=1, verbose=args.verbose)
 
         print("benchmark - generate")
         timers("generate").reset()
         output_ids = model.generate(
-            inputs, max_new_tokens=args.gen_len,
+            input_in_tokens, max_new_tokens=args.gen_len,
             debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
         costs = timers("generate").costs
     finally:
@@ -1316,6 +1331,12 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+
+    # hacked 
+    parser.add_argument("--input-file", type=str, 
+        help="input file containing prompts, "
+        ".txt contains 1 prompt, "
+        ".json for many prompts")
 
 
 if __name__ == "__main__":

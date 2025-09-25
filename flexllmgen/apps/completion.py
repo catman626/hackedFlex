@@ -4,6 +4,8 @@ import argparse
 from flexllmgen.flex_opt import (Policy, OptLM, ExecutionEnv, CompressionConfig,
         str2bool)
 from transformers import AutoTokenizer
+from flexllmgen.opt_config import OptConfig, get_opt_config
+from flexllmgen.utils import  GB, T
 
 def get_prompts(prompt_file):
     if prompt_file.endswith("txt"):
@@ -34,7 +36,7 @@ def main(args):
         "Airport codes:",
     ]
 
-    prompts = get_prompts(args.input_file)
+    # prompts = get_prompts(args.input_file)
 
     # Initialize environment
     env = ExecutionEnv.create(args.offload_dir)
@@ -67,6 +69,17 @@ def main(args):
     print("Generate...")
     inputs = tokenizer(prompts, padding="longest")
     print(f" >>> input length padded to {len(inputs.input_ids[0])}")
+
+    prompt_len = len(inputs[0])
+    num_prompts = len(inputs)
+    gen_len = 32
+    opt_config = get_opt_config(args.model)
+    cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
+    hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
+    print(f" >>> model size: {opt_config.model_bytes()/GB:.3f} GB, "
+          f" >>> cache size: {cache_size/GB:.3f} GB, "
+          f" >>> hidden size (prefill): {hidden_size/GB:.3f} GB")
+
     output_ids = model.generate(
         inputs.input_ids,
         do_sample=True,
