@@ -230,7 +230,11 @@ def download_opt_weights(model_name, path):
     elif "galactica" in model_name:
         hf_model_name = "facebook/" + model_name
 
-    folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
+    # folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
+    # replace to skip the hf download process 
+    # instead use a model-dir downloaded ahead of time
+    folder = os.path.join("/inference/model", model_name)
+
     bin_files = glob.glob(os.path.join(folder, "*.bin"))
 
     if "/" in model_name:

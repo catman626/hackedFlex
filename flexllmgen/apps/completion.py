@@ -42,6 +42,7 @@ def main(args):
 
     # Model
     print("Initialize...")
+    
     tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
     tokenizer.add_bos_token = False
     stop = tokenizer("\n").input_ids[0]
