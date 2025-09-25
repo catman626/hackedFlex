@@ -5,9 +5,22 @@ from flexllmgen.flex_opt import (Policy, OptLM, ExecutionEnv, CompressionConfig,
         str2bool)
 from transformers import AutoTokenizer
 
+def get_prompts(prompt_file):
+    if prompt_file.endswith("txt"):
+        # represent only one query
+        prompts = open(prompt_file).read()
+        prompts = [ prompts] 
+    elif prompt_file.endswith("json"):
+        import json
+        jsonfile = json.load(open(prompt_file))
+        prompts = [ j["prompt"] for j in jsonfile]
+
+    return prompts
+
 
 def main(args):
     # Prompts
+    
     prompts = [
         "Question: Where were the 2004 Olympics held?\n"
         "Answer: Athens, Greece\n"
@@ -20,6 +33,8 @@ def main(args):
         "Text: \"I want you to book a flight from Phoenix to Las Vegas.\"\n"
         "Airport codes:",
     ]
+
+    prompts = get_prompts(args.input_file)
 
     # Initialize environment
     env = ExecutionEnv.create(args.offload_dir)
@@ -50,7 +65,8 @@ def main(args):
 
     # Generate
     print("Generate...")
-    inputs = tokenizer(prompts, padding="max_length", max_length=128)
+    inputs = tokenizer(prompts, padding="longest")
+    print(f" >>> input length padded to {len(inputs.input_ids[0])}")
     output_ids = model.generate(
         inputs.input_ids,
         do_sample=True,
@@ -91,11 +107,11 @@ if __name__ == "__main__":
     parser.add_argument("--cpu-cache-compute", action="store_true")
     parser.add_argument("--compress-weight", action="store_true",
         help="Whether to compress weight.")
+
     parser.add_argument("--compress-cache", action="store_true",
-        help="Whether to compress cache.")
+    help="Whether to compress cache.")
+    parser.add_argument("--input-file", type=str)
+
     args = parser.parse_args()
-
-    assert len(args.percent) == 6
-
     main(args)
-
+    
