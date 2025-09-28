@@ -233,7 +233,11 @@ def download_opt_weights(model_name, path):
     # folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
     # replace to skip the hf download process 
     # instead use a model-dir downloaded ahead of time
+<<<<<<< HEAD
     folder = os.path.join("/inference/model", model_name)
+=======
+    folder = os.path.join(os.path.expanduser("~/inference/model"), model_name)
+>>>>>>> 31ecd9def327091cbe965dc87ed55aae1355ac14
 
     bin_files = glob.glob(os.path.join(folder, "*.bin"))
 
