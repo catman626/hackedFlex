@@ -569,14 +569,19 @@ class TransformerLayer:
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
+        # i : id of layer 
+        # k : id of gpu batch
         if k == self.policy.num_gpu_batches - 1:
             read_buf1, read_buf2 = weight_read_buf.pop()
         else:
             read_buf1, read_buf2 = weight_read_buf.val
 
+        print(f" >>> pre layer-{i} attention")
         self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
                                cache_write_buf, i, k)
+        print(f" >>> post layer-{i} attention")
         self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
+        print(f" >>> post layer-{i} mlp")
 
 
 class OptLM:
@@ -595,12 +600,12 @@ class OptLM:
 
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
-        for i in range(self.config.num_hidden_layers):
+        for j in range(self.config.num_hidden_layers):
             if policy.sep_layer:
-                layers.append(SelfAttention(self.config, self.env, self.policy, i))
-                layers.append(MLP(self.config, self.env, self.policy, i))
+                layers.append(SelfAttention(self.config, self.env, self.policy, j))
+                layers.append(MLP(self.config, self.env, self.policy, j))
             else:
-                layers.append(TransformerLayer(self.config, self.env, self.policy, i))
+                layers.append(TransformerLayer(self.config, self.env, self.policy, j))
         layers.append(OutputEmbed(self.config, self.env, self.policy))
         self.layers = layers
         self.num_layers = len(layers)
@@ -786,6 +791,8 @@ class OptLM:
         # Clear the weight_read_buf if it is the last gpu batch
         # Clear the cache_read_buf
         # Run layer computation
+
+        
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
             self.weight_read_buf[j], self.attention_mask[k],
             self.cache_write_buf[j][k], i, k)
@@ -1175,20 +1182,35 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
                           max_length=prompt_len).input_ids
     return (input_ids[0],) * num_prompts
 
+def get_file_inputs(fname, tokenizer):
+    if fname.endswith(".txt"):
+        prompt = open(fname).read()
+        prompts = [ prompt ]
+    elif fname.endswith(".json"):
+        import json
+        prompts = json.load(open(fname))
+        prompts = [ p["prompt"] for p in prompts ]  
 
+    return prompts
+
+    
+   
 def run_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
     if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
     else:
-        model_path = os.path.join("~/inference/model", args.model)
-        tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
 
     # Task and policy
+    
     warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
-    inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
+    file_inputs = get_file_inputs(1, num_prompts, tokenizer)
+    input_in_tokens, = tokenizer(file_inputs, padding="longest")
+    
+    # inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
@@ -1222,12 +1244,12 @@ def run_flexllmgen(args):
     try:
         print("warmup - generate")
         output_ids = model.generate(
-            warmup_inputs, max_new_tokens=1, verbose=args.verbose)
-
+            warmup_inputs, max_new_tokens=1, verbose=args.verbose
+        )
         print("benchmark - generate")
         timers("generate").reset()
         output_ids = model.generate(
-            inputs, max_new_tokens=args.gen_len,
+            input_in_tokens, max_new_tokens=args.gen_len,
             debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
         costs = timers("generate").costs
     finally:
@@ -1316,6 +1338,12 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+
+    # hacked 
+    parser.add_argument("--input-file", type=str, 
+        help="input file containing prompts, "
+        ".txt contains 1 prompt, "
+        ".json for many prompts")
 
 
 if __name__ == "__main__":
