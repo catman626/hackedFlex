@@ -1207,7 +1207,7 @@ def run_flexllmgen(args):
     # Task and policy
     
     warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
-    file_inputs = get_file_inputs(1, num_prompts, tokenizer)
+    file_inputs = get_file_inputs(args.input_file)
     input_in_tokens, = tokenizer(file_inputs, padding="longest")
     
     # inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
