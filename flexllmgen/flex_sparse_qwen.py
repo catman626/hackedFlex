@@ -168,7 +168,7 @@ class InputEmbed:
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
 
-    def load_cache(self, cache_home, cache_read_buf, i):
+    def load_cache(self, cache_home, cache_read_buf, i, selected_idx):
         pass  # do nothing
 
     def store_cache(self, cache_home, cache_write_buf, i):
@@ -236,7 +236,7 @@ class OutputEmbed:
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
 
-    def load_cache(self, cache_home, cache_read_buf, i):
+    def load_cache(self, cache_home, cache_read_buf, i, selected_idx):
         pass  # do nothing
 
     def store_cache(self, cache_home, cache_write_buf, i):
@@ -335,7 +335,7 @@ class SelfAttention:
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
         cache_home.store(cache)
 
-    def load_cache(self, cache_home, cache_read_buf, i):
+    def load_cache(self, cache_home, cache_read_buf, i, selected_idx):
         if i == 0:  # prefill, no cache
             return
 
@@ -358,8 +358,13 @@ class SelfAttention:
 
         if path == 0:  # Direct copy
             # shape: (s, b * n_head, head_dim)
-            indices = (slice(0, self.task.prompt_len + i),
+            # indices = (slice(0, self.task.prompt_len + i),
+            #            slice(0, k_home.shape[1]))
+
+            # hack
+            indices = (slice(selected_idx),
                        slice(0, k_home.shape[1]))
+            
 
             if self.policy.attn_sparsity >= 1.0:
                 cache_read_buf.store((
@@ -426,6 +431,9 @@ class SelfAttention:
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
+        # attention mask should be (attn_mask, selected_idx)
+        # i for decode step no / sequence dim
+        # k for gou block no
         n_head = self.config.n_head
 
         donate = [False] * 14
@@ -561,14 +569,15 @@ class TransformerLayer:
     def init_cache_one_gpu_batch(self, cache_home):
         self.attention.init_cache_one_gpu_batch(cache_home)
 
-    def load_cache(self, cache_home, cache_read_buf, i):
-        self.attention.load_cache(cache_home, cache_read_buf, i)
+    def load_cache(self, cache_home, cache_read_buf, i, selected_idx):
+        self.attention.load_cache(cache_home, cache_read_buf, i, selected_idx)
 
     def store_cache(self, cache_home, cache_write_buf, i):
         self.attention.store_cache(cache_home, cache_write_buf, i)
 
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+    def forward_backup(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
+        # rename to ensure not called in hacked script
         # i : id of layer 
         # k : id of gpu batch
         if k == self.policy.num_gpu_batches - 1:
@@ -583,8 +592,36 @@ class TransformerLayer:
         self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
         print(f" >>> post layer-{i} mlp")
 
+    def compute_linear(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+                cache_write_buf, i, k):
+        # i for decode step no / sequence dim
+        # k for gou block no
+        # attention mask should be (attn_mask, selected_idx)
+        if k == self.policy.num_gpu_batches - 1:
+            read_buf1, read_buf2 = weight_read_buf.pop()
+        else:
+            read_buf1, read_buf2 = weight_read_buf.val
 
-class OptLM:
+        print(f" >>> pre layer-{i} attention")
+        # attention mask will not be used, but for better readability, still posed here
+        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
+        print(f" >>> post layer-{i} mlp")
+
+        
+    def compute_attention(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+                cache_write_buf, i, k):
+        # i for decode step no / sequence dim
+        # k for gou block no
+        # attention mask should be (attn_mask, selected_idx)
+        read_buf1, read_buf2 = weight_read_buf.val
+
+        print(f" >>> pre layer-{i} attention")
+        self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
+                               cache_write_buf, i, k)
+        print(f" >>> post layer-{i} attention")
+
+
+class QwenLM:
     def __init__(self,
                  config: Union[str, OptConfig],
                  env: ExecutionEnv,
@@ -637,6 +674,9 @@ class OptLM:
         self.weight_read_buf = array_1d(num_layers, ValueHolder)
         # attention_mask[k]
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
+
+        # hacked by catman
+        self.selected_idx = array_1d(num_gpu_batches, ValueHolder)
 
         self.task = None
         self.init_all_weights()
@@ -697,10 +737,11 @@ class OptLM:
 
         # Load from cache_home to cache_read_buf
         if overlap:
+            assert 0
             with torch.cuda.stream(self.load_cache_stream):
-                self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+                self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i, self.selected_idx[k])
         else:
-            self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+            self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i, self.selected_idx[k])
 
     def store_cache(self, i, j, k, overlap=True):
         # Handle corner cases
@@ -797,6 +838,28 @@ class OptLM:
             self.weight_read_buf[j], self.attention_mask[k],
             self.cache_write_buf[j][k], i, k)
 
+    def compute_attention(self, i, j, k) :
+        if self.is_embedding_layer(j):
+            return 
+
+        self.layers[j].compute_attention(self.hidden[i][j][k], self.cache_read_buf[j][k],
+            self.weight_read_buf[j], self.attention_mask[k],
+            self.cache_write_buf[j][k], i, k)
+
+    def compute_linear(self, i, j, k):
+        if self.is_embedding_layer(j):
+            self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
+                self.weight_read_buf[j], self.attention_mask[k],
+                self.cache_write_buf[j][k], i, k)
+            return 
+
+        self.layers[j].compute_linear(self.hidden[i][j][k], self.cache_read_buf[j][k],
+            self.weight_read_buf[j], self.attention_mask[k],
+            self.cache_write_buf[j][k], i, k)
+
+        
+
+
     def sync(self):
         self.env.disk.synchronize()
         torch.cuda.synchronize()
@@ -828,6 +891,12 @@ class OptLM:
             (self.policy.gpu_batch_size, self.task.prompt_len), bool)
         val.load_from_np((input_ids != self.config.pad_token_id))
         self.attention_mask[k].store(val)
+
+    def sparse_select(self, i, j, k):
+        # for test: only select the last 128 tokens
+        window_size = 128
+        prompt_len = self.task.prompt_len
+        self.selected_idx = np.arange(max(0, prompt_len + i -window_size))
 
     def generate(self,
                  inputs: Union[np.array, List[List[int]]],
@@ -916,6 +985,12 @@ class OptLM:
 
         return self.output_ids
 
+    
+    def is_embedding_layer(self, layerno):
+        return layerno == 0 or layerno == self.num_layers-1
+
+
+
     def generation_loop_normal(self):
         for i in range(self.execute_gen_len):
             timers("generate").start()
@@ -926,12 +1001,21 @@ class OptLM:
                     self.load_weight(i, j, k, overlap=False)
 
                 for k in range(self.num_gpu_batches):
-                    self.load_cache(i, j, k, overlap=False)
-                    self.load_hidden(i, j, k)
-                    self.compute_layer(i, j, k)
-                    self.store_hidden(i, j, k)
-                    self.store_cache(i, j, k, overlap=False)
+                    # self.load_cache(i, j, k, overlap=False)
+                    # self.load_hidden(i, j, k)
+                    # self.compute_layer(i, j, k)
+                    # self.store_hidden(i, j, k)
+                    # self.store_cache(i, j, k, overlap=False)
+                    
+                    # hacked by catman
+                    self.sparse_select(i, j, k)
+                    self.load_cache(i, j, k)
+                    self.compute_attention(i, j, k)
+                    self.store_cache(i, j, k)
+                    self.compute_linear(i, j, k)
+                    
             timers("generate").stop()
+
 
     def generation_loop_debug_normal(self):
         execute_num_batches = 20
@@ -1207,7 +1291,6 @@ def run_flexllmgen(args):
 
     # Task and policy
     
-    
     if args.input_file is not None:  
         inputs = get_file_inputs(args.input_file)
         input_in_tokens = tokenizer(inputs, padding="longest").input_ids
@@ -1246,7 +1329,7 @@ def run_flexllmgen(args):
           f"hidden size (prefill): {hidden_size/GB:.3f} GB")
 
     print("init weight...")
-    model = OptLM(opt_config, env, args.path, policy)
+    model = QwenLM(opt_config, env, args.path, policy)
 
     try:
         print("warmup - generate")
