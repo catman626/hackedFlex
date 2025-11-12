@@ -1201,22 +1201,19 @@ def run_flexllmgen(args):
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
     else:
         tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
-        print(f" >>> tokenizer use model: {args.model}")
-    num_prompts = args.num_gpu_batches * args.gpu_batch_size
+        # print(f" >>> tokenizer use model: {args.model}")
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
+    num_prompts = args.num_gpu_batches * args.gpu_batch_size
 
     # Task and policy
-    
     
     if args.input_file is not None:  
         inputs = get_file_inputs(args.input_file)
         input_in_tokens = tokenizer(inputs, padding="longest").input_ids
     else:
         input_in_tokens = get_test_inputs(args.prompt_len, num_prompts, tokenizer)
-        
 
     warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
-    
     # inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
     gpu = TorchDevice("cuda:0")
@@ -1250,6 +1247,7 @@ def run_flexllmgen(args):
 
     try:
         print("warmup - generate")
+        print(f" >>> warmup inputs in type: {type(warmup_inputs)}")
         output_ids = model.generate(
             warmup_inputs, max_new_tokens=1, verbose=args.verbose
         )
