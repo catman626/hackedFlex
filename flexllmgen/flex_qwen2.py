@@ -4,6 +4,16 @@ import torch.nn.functional as F
 from typing import Optional, List, Tuple
 from transformers import Qwen2ForCausalLM, AutoTokenizer
 from safetensors.torch import load_file
+import os
+
+from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
+    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
+from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
+    array_1d, array_2d, array_3d, str2bool, project_decode_latency,
+    torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
+    read_benchmark_log)
+
+from flex_opt import init_weight_list
 
 # 1. 定义模型配置（与Qwen2-0.5B完全匹配）
 qwen2_config = {
@@ -62,7 +72,6 @@ def apply_rope(x: torch.Tensor, position_embedding: tuple[torch.Tensor, torch.Te
     x_embed  = (x * cos) + (rotate_half(x) * sin)
     return x_embed
 
-
 def eager_attention_core(q, k, v , seq_len, head_dim, device):
     casual_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
     casual_mask = casual_mask.unsqueeze(0).unsqueeze(0)
@@ -73,6 +82,227 @@ def eager_attention_core(q, k, v , seq_len, head_dim, device):
     attn_output = attn_weights @ v
 
     return attn_output
+
+
+
+
+class SelfAttention:
+    def __init__(self, config, env, policy, layer_id):
+        self.config = config
+        self.env = env
+        self.layer_id = layer_id
+        self.policy = policy
+        self.compute = self.env.gpu
+        self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
+            else self.compute)
+        self.attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
+            else self.env.gpu)
+
+        self.task = None
+
+    def set_task(self, task):
+        self.task = task
+
+    def init_weight(self, weight_home, path):
+        h, dtype = (self.config.input_dim, self.config.dtype)
+        path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}.self_attn"))
+        weight_specs = [
+            # w_q
+            ((h, h), dtype, path + ".q_proj.weight"),
+            # b_q
+            ((h,), dtype, path + ".q_proj.bias"),
+            # w_k
+            ((h, h), dtype, path + ".k_proj.weight"),
+            # b_k
+            ((h,), dtype, path + ".k_proj.bias"),
+            # w_v
+            ((h, h), dtype, path + ".v_proj.weight"),
+            # b_v
+            ((h,), dtype, path + ".v_proj.bias"),
+            # w_out
+            ((h, h), dtype, path + ".out_proj.weight"),
+            # b_out, o_proj have no bias in qwen2
+            # ((h,), dtype, path + ".out_proj.bias"),
+            # w_ln
+            ((h,), dtype, path + "input_layernorm.weight"),
+            # # b_ln, rms has no bias
+            # ((h,), dtype, path + "_layer_norm.bias"),
+        ]
+        weights = init_weight_list(weight_specs, self.policy, self.env)
+        weight_home.store(weights)
+
+    def load_weight(self, weight_home, weight_read_buf, k):
+        w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln = weight_home.val
+        if k == 0:
+            dst1 = self.weight_load_dst
+            dst2 = self.compute
+            weight_read_buf.store((
+                w_q.smart_copy(dst1), b_q.smart_copy(dst2),
+                w_k.smart_copy(dst1), b_k.smart_copy(dst2),
+                w_v.smart_copy(dst1), b_v.smart_copy(dst2),
+                w_out.smart_copy(dst1), 
+                w_ln.smart_copy(dst2)))
+            # weight_read_buf.store((
+            #     w_q.smart_copy(dst1), b_q.smart_copy(dst2),
+            #     w_k.smart_copy(dst1), b_k.smart_copy(dst2),
+            #     w_v.smart_copy(dst1), b_v.smart_copy(dst2),
+            #     w_out.smart_copy(dst1), b_out.smart_copy(dst2),
+            #     w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
+
+    def init_cache_one_gpu_batch(self, cache_home):
+        if self.policy.cache_gpu_percent == 100:
+            device = self.env.gpu
+        elif self.policy.cache_cpu_percent == 100:
+            device = self.env.cpu
+        elif self.policy.cache_disk_percent == 100:
+            device = self.env.disk
+        else:
+            device = self.env.mixed
+
+        if self.policy.compress_cache:
+            assert device.device_type != DeviceType.MIXED
+            device = device.compressed_device
+
+        cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
+        cache_home.store(cache)
+
+    def load_cache(self, cache_home, cache_read_buf, i):
+        if i == 0:  # prefill, no cache
+            return
+
+        k_home, v_home = cache_home.val
+
+        # Pick code path
+        if self.policy.compress_cache:
+            path = 0
+            dst = self.attention_compute.compressed_device
+        else:
+            if self.policy.cpu_cache_compute:
+                if (k_home.device.device_type == DeviceType.MIXED and
+                    k_home.data[0][0] is not None):
+                    path = 2
+                else:
+                    path = 1
+            else:
+                path = 0
+            dst = self.attention_compute
+
+        if path == 0:  # Direct copy
+            # shape: (s, b * n_head, head_dim)
+            indices = (slice(0, self.task.prompt_len + i),
+                       slice(0, k_home.shape[1]))
+
+            if self.policy.attn_sparsity >= 1.0:
+                cache_read_buf.store((
+                    k_home.smart_copy(dst, indices),
+                    v_home.smart_copy(dst, indices),
+                ))
+            else:
+                cache_read_buf.store((
+                    k_home.smart_copy(dst, indices),
+                    (v_home, False),
+                ))
+        elif path == 1:  # Copy to CPU temporary workspace
+            # shape: (s, b * n_head, head_dim)
+            k_buf, v_buf = dst.next_attention_compute_workspace()
+            indices = (slice(0, self.task.prompt_len + i - 1),
+                       slice(0, k_home.shape[1]))
+            general_copy(k_buf, indices, k_home, indices)
+
+            if self.policy.attn_sparsity >= 1.0:
+                general_copy(v_buf, indices, v_home, indices)
+                cache_read_buf.store(((k_buf, False), (v_buf, False)))
+            else:
+                cache_read_buf.store(((k_buf, False), ((v_home, v_buf), False)))
+        elif path == 2:  # Copy to both GPU and CPU
+            # The caches are stored on both GPU and other devices.
+            # Compute attention on gpu for caches stored on gpu.
+            # Compute attention on cpu for caches stored on cpu/disk.
+            gpu_k_buf = k_home.data[0][0]
+            gpu_v_buf = v_home.data[0][0]
+
+            # shape: (s, b * n_head, head_dim)
+            k_buf, v_buf = dst.next_attention_compute_workspace()
+            indices = (slice(0, self.task.prompt_len + i - 1),
+                       slice(gpu_k_buf.shape[1], k_home.shape[1]))
+            general_copy(k_buf, indices, k_home, indices)
+            general_copy(v_buf, indices, v_home, indices)
+            cache_read_buf.store((((gpu_k_buf, k_buf,), False),
+                                  ((gpu_v_buf, v_buf,), False)))
+            assert self.policy.attn_sparsity >= 1.0
+        else:
+            raise ValueError(f"Invalid path: {path}")
+
+    def store_cache(self, cache_home, cache_write_buf, i):
+        # shape: (s, b * n_head, head_dim)
+        k_home, v_home = cache_home.val
+        k_new, v_new = cache_write_buf.pop()
+
+        if i == self.task.gen_len - 1:  # last token, no need to store cache
+            return
+
+        if i == 0:  # prefill
+            indices = (slice(0, k_new.shape[0]),
+                       slice(0, k_new.shape[1]))
+        else:  # decoding
+            pos = self.task.prompt_len + i
+            indices = (slice(pos - k_new.shape[0], pos),
+                       slice(0, k_new.shape[1]))
+
+        general_copy(k_home, indices, k_new, None)
+        general_copy(v_home, indices, v_new, None)
+
+    def input_act_shape_and_dtype(self, batch_size, seq_len):
+        return (batch_size, seq_len, self.config.input_dim), self.config.dtype
+
+    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+                cache_write_buf, i, k):
+        n_head = self.config.n_head
+
+        donate = [False] * 14   # keep 14, but idx for b_out will not be used
+        # 0:hidden, 1:mask, 2-11:weight, 12:kcache, 13:vcache
+        
+        h, donate[0] = hidden.val, True
+
+        if k == self.policy.num_gpu_batches - 1:
+            # Clear the weight_read_buf if it is the last gpu batch
+            # ((w_q, donate[2]), (b_q, donate[3]), (w_k, donate[4]), (b_k, donate[5]),
+            #  (w_v, donate[6]), (b_v, donate[7]), (w_out, donate[8]), (b_out, donate[9]),
+            #  (w_ln, donate[10]), (b_ln, donate[11])) = weight_read_buf.pop()
+            ((w_q, donate[2]), (b_q, donate[3]), (w_k, donate[4]), (b_k, donate[5]),
+             (w_v, donate[6]), (b_v, donate[7]), (w_out, donate[8]),
+             (w_ln, donate[10])) = weight_read_buf.pop()
+        else:
+            # ((w_q, _), (b_q, _), (w_k, _), (b_k, _),
+            #  (w_v, _), (b_v, _), (w_out, _), (b_out, _),
+            #  (w_ln, _), (b_ln, _)) = weight_read_buf.val
+            ((w_q, _), (b_q, _), (w_k, _), (b_k, _),
+             (w_v, _), (b_v, _), (w_out, _), 
+             (w_ln, _)) = weight_read_buf.val
+
+        if i == 0:  # prefill
+            mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+            # h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
+            #     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
+            #     self.policy.compress_cache, self.policy.comp_cache_config)
+            h, new_k_cache, new_v_cache = self.compute.gqa(h, mask, w_q, b_q,
+                w_k, b_k, w_v, b_v, w_out, w_ln, n_head, donate,
+                self.policy.compress_cache, self.policy.comp_cache_config)
+            cache_write_buf.store((new_k_cache, new_v_cache))
+        else:  # decoding
+            mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
+            (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
+            # h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
+            #     b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
+            #     k_cache, v_cache, donate, self.policy.attn_sparsity,
+            #     self.policy.compress_cache, self.policy.comp_cache_config)
+            h, new_k_cache, new_v_cache = self.compute.gqa_gen(h, mask, w_q,
+                b_q, w_k, b_k, w_v, b_v, w_out, w_ln, n_head,
+                k_cache, v_cache, donate, self.policy.attn_sparsity,
+                self.policy.compress_cache, self.policy.comp_cache_config)
+            cache_write_buf.store((new_k_cache, new_v_cache))
+
+        hidden.val = h
 
 class Attention(nn.Module):
     def __init__(self, hidden_size: int, num_attention_heads: int, num_key_value_heads: int, device: torch.device, layer_idx:int):
@@ -137,6 +367,7 @@ class Attention(nn.Module):
         return attn_output
 
 
+
 class FeedForward(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, device: torch.device):
         super().__init__()
@@ -147,6 +378,92 @@ class FeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
+class MLP:
+    def __init__(self, config, env, policy, layer_id):
+        self.config = config
+        self.env = env
+        self.layer_id = layer_id
+        self.policy = policy
+        self.compute = self.env.gpu
+        self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
+            else self.compute)
+
+        self.task = None
+
+    def set_task(self, task):
+        self.task = task
+
+    def init_weight(self, weight_home, path):
+        h, dtype = (self.config.input_dim, self.config.dtype)
+        path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}."))
+        
+        intermediated_size = self.config.intermediate_size
+        hidden_size = self.config.hidden_size
+        dtype = self.config.dtype
+        
+        weight_specs = [
+            # wg
+            ((intermediated_size, hidden_size), dtype, path + "gate_proj.weight"),
+            # wup
+            ((intermediated_size, hidden_size), dtype, path + "up_proj.weight"),
+            # wdown
+            ((hidden_size, intermediated_size), dtype, path + "down_proj.weight"),
+            # w_ln
+            ((hidden_size, ), dtype, path + "post_attention_layernorm")
+        ]
+        weights = init_weight_list(weight_specs, self.policy, self.env)
+        weight_home.store(weights)
+
+    def load_weight(self, weight_home, weight_read_buf, k):
+        w_gate, w_up, w_down = weight_home.val
+        if k == 0:
+            dst1 = self.weight_load_dst
+            dst2 = self.compute
+            # weight_read_buf.store((
+                # wi.smart_copy(dst1), bi.smart_copy(dst2),
+                # wo.smart_copy(dst1), bo.smart_copy(dst2),
+           #     w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
+            weight_read_buf.store(
+                ( w_gate.smart_copy(dst1),
+                w_up.smart_copy(dst1),
+                w_down.smart_copy(dst2) )
+            )
+
+    def init_cache_one_gpu_batch(self, cache_home):
+        pass  # do nothing
+
+    def load_cache(self, cache_home, cache_read_buf, i):
+        pass  # do nothing
+
+    def store_cache(self, cache_home, cache_write_buf, i):
+        pass  # do nothing
+
+    def input_act_shape_and_dtype(self, batch_size, seq_len):
+        return (batch_size, seq_len, self.config.input_dim), self.config.dtype
+
+    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+                cache_write_buf, i, k):
+        donate = [False] * 7
+        h, donate[0] = hidden.val, True
+
+        if k == self.policy.num_gpu_batches - 1:
+            # Clear the weight_read_buf if it is the last gpu batch
+            (
+                (w_gate,    donate[1]), 
+                (w_up,      donate[2]), 
+                (w_down,    donate[3]), 
+                (w_ln,      donate[4])
+            ) = weight_read_buf.pop()
+        else:
+            (
+                (w_gate,    _), 
+                (w_up,      _), 
+                (w_down,    _), 
+                (w_ln,      _)
+            ) = weight_read_buf.val
+
+        h = self.compute.qwen2mlp(h, w_gate, w_up, w_down, w_ln, donate)
+        hidden.val = h
 
 class Qwen2Block(nn.Module):
     def __init__(self, hidden_size: int, num_attention_heads: int, num_key_value_heads: int, 

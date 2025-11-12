@@ -1214,6 +1214,7 @@ def run_flexllmgen(args):
         input_in_tokens = get_test_inputs(args.prompt_len, num_prompts, tokenizer)
 
     warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
+    
     # inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
     gpu = TorchDevice("cuda:0")
