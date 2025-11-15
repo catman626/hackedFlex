@@ -13,41 +13,52 @@ import shutil
 import numpy as np
 from tqdm import tqdm
 
+from safetensors.torch import load_file, load, save_file
+import torch
+
 
 @dataclasses.dataclass(frozen=True)
-class OptConfig:
-    name: str = "opt-125m"
-    num_hidden_layers: int = 12
-    max_seq_len: int = 2048
-    hidden_size: int = 768
-    n_head: int = 12
-    input_dim: int = 768
-    ffn_embed_dim: int = 3072
-    pad: int = 1
-    activation_fn: str = 'relu'
-    vocab_size: int = 50272
-    layer_norm_eps: float = 0.00001
-    pad_token_id: int = 1
-    dtype: type = np.float16
+class QwenConfig :
+    name="Qwen/Qwen2-0.5B"
+    vocab_size = 151936
+    hidden_size = 896
+    num_attention_heads = 14
+    num_key_value_heads = 2
+    intermediate_size = 4864
+    max_position_embeddings = 131072
+    rms_norm_eps = 1e-6
+    rope_theta = 1000000.0
+    bos_token_id = 151643
+    eos_token_id = 151643
+    num_hidden_layers = 24
+    dtype = torch.bfloat16
 
-    def model_bytes(self):
-        h = self.input_dim
-        return 	2 * (self.num_hidden_layers * (
-        # self-attention
-        h * (3 * h + 1) + h * (h + 1) +
-        # mlp
-        h * (4 * h + 1) + h * 4 * (h + 1) +
-        # layer norm
-        h * 4) +
-        # embedding
-        self.vocab_size * (h + 1))
+    def model_bytes(self) -> int:
+        h, n_layers = self.hidden_size, self.num_hidden_layers
+        head_dim = h // self.num_attention_heads
+        
+        # 嵌入层参数（词嵌入）
+        embed = self.vocab_size * h
+        # 每层注意力参数（QKV投影+输出投影+RMSNorm）
+        attn = h*h + h*(self.num_key_value_heads * head_dim * 2) + h*h + h
+        # 每层MLP参数（SwiGLU双投影+输出投影+RMSNorm）
+        mlp = h * (self.intermediate_size * 2) + self.intermediate_size * h + h
+        
+        return (embed + n_layers * (attn + mlp)) * 2  # ×2对应float16字节数
 
-    def cache_bytes(self, batch_size, seq_len):
-        return 2 * batch_size * seq_len * self.num_hidden_layers * self.input_dim * 2
+    def cache_bytes(self, batch_size: int, seq_len: int) -> int:
+        head_dim = self.hidden_size // self.num_attention_heads
+        # 每组KV缓存（K+V各一份）× 层数 × 字节数
+        return batch_size * self.num_key_value_heads * seq_len * head_dim * 2 * self.num_hidden_layers * 2
 
-    def hidden_bytes(self, batch_size, seq_len):
-        return batch_size * seq_len * self.input_dim * 2
+    def hidden_bytes(self, batch_size: int, seq_len: int) -> int:
+        # 隐藏状态张量（batch×seq×hidden）× 字节数
+        return batch_size * seq_len * self.hidden_size * 2
 
+
+def get_qwen_config(name):
+    assert name == "Qwen/Qwen2-0.5B"
+    return QwenConfig()
 
 def get_opt_config(name, **kwargs):
     if "/" in name:
@@ -216,52 +227,40 @@ def disable_hf_opt_init():
             "_init_weights", lambda *args, **kwargs: None)
 
 
-def download_opt_weights(model_name, path):
-    from huggingface_hub import snapshot_download
+def convert_qwen_weights(model_name, path):
+    model_path = "/home/llmserver/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B/snapshots/91d2aff3f957f99e4c74c962f2f408dcc88a18d8"
+    huggingface_cache =  "./huggingface_cache"
+    if not os.path.exists(huggingface_cache):
+        os.symlink(model_path, huggingface_cache)
+    safetensor_files = glob.glob(os.path.join(huggingface_cache, "*.safetensors"))
+
+
+    seperated_weight_dir = os.path.join(path, f"{model_name}-np")
+    os.makedirs(seperated_weight_dir, exist_ok=True)
+
     import torch
 
-    print(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
-          f"The downloading and cpu loading can take dozens of minutes. "
-          f"If it seems to get stuck, you can monitor the progress by "
-          f"checking the memory usage of this process.")
-
-    if "opt" in model_name:
-        hf_model_name = "facebook/" + model_name
-    elif "galactica" in model_name:
-        hf_model_name = "facebook/" + model_name
-
-    # folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
-    # replace to skip the hf download process 
-    # instead use a model-dir downloaded ahead of time
-    folder = os.path.join(os.path.expanduser("~/inference/model"), model_name)
-
-    bin_files = glob.glob(os.path.join(folder, "*.bin"))
-
-    if "/" in model_name:
-        model_name = model_name.split("/")[1].lower()
-    path = os.path.join(path, f"{model_name}-np")
-    path = os.path.abspath(os.path.expanduser(path))
-    os.makedirs(path, exist_ok=True)
-
-    for bin_file in tqdm(bin_files, desc="Convert format"):
-        state = torch.load(bin_file)
+    for safetensor_file in tqdm(safetensor_files, desc="Convert format"):
+        state = load_file(safetensor_file)
         for name, param in tqdm(state.items(), leave=False):
             name = name.replace("model.", "")
             name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
-            param_path = os.path.join(path, name)
+            param_path = os.path.join(seperated_weight_dir, name)
             with open(param_path, "wb") as f:
-                np.save(f, param.cpu().detach().numpy())
+                torch.save(param.cpu().detach(), f)
+                # save_file(param.cpu().detach(), f)
+                # np.save(f, param.cpu().detach().numpy())
 
             # shared embedding
-            if "decoder.embed_tokens.weight" in name:
-                shutil.copy(param_path, param_path.replace(
-                    "decoder.embed_tokens.weight", "lm_head.weight"))
+            # if "decoder.embed_tokens.weight" in name:
+            #     shutil.copy(param_path, param_path.replace(
+            #         "decoder.embed_tokens.weight", "lm_head.weight"))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str)
-    parser.add_argument("--path", type=str, default="~/opt_weights")
+    parser.add_argument("--path", type=str, default="opt_weights")
     args = parser.parse_args()
 
-    download_opt_weights(args.model, args.path)
+    convert_qwen_weights(args.model, args.path)

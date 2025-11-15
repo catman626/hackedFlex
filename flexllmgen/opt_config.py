@@ -49,6 +49,7 @@ class OptConfig:
         return batch_size * seq_len * self.input_dim * 2
 
 
+
 def get_opt_config(name, **kwargs):
     if "/" in name:
         name = name.split("/")[1]
@@ -217,6 +218,11 @@ def disable_hf_opt_init():
 
 
 def download_opt_weights(model_name, path):
+    '''
+    download model
+    convert model to seperated-weights, eg layers.0.attn.q_proj...
+    save seperated-weights at path/model_name-np/
+    '''
     from huggingface_hub import snapshot_download
     import torch
 
