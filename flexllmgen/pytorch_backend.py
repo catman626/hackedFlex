@@ -31,7 +31,13 @@ def fix_recursive_import():
 # TODO
 # add gqa, gqa_gen
 # add qwen_mlp 
+def cache_shape(config, task, policy):
+    n_qhead, n_kvhead, hidden_size, prompt_len, gen_len, gpu_batch_size = (
+        config.n_qhead, config.n_kvhead, config.hidden_size, task.prompt_len, task.gen_len,
+        policy.gpu_batch_size)
+    shape = (prompt_len + gen_len - 1, gpu_batch_size * n_kvhead, hidden_size // n_qhead * n_kvhead)
 
+    return shape
 
 class DeviceType(Enum):
     CPU = auto()
@@ -111,7 +117,7 @@ class TorchTensor:
         self.device = self.data = None
 
     def load_from_np(self, np_array):
-        if self.device.device_type == DeviceType.DISK:
+        if self.device.device_type == DeviceType.DISK:  # save to np file
             with open(self.data, "wb") as fout:
                 np.save(fout, np_array)
         else:
@@ -119,14 +125,16 @@ class TorchTensor:
                 tmp = torch.from_numpy(np_array)
                 tmp = global_cpu_device.compressed_device.compress(tmp, self.data[2])
                 general_copy(self, None, tmp, None)
-            else:
+            else:   
+                
                 self.data.copy_(torch.from_numpy(np_array))
 
     def load_from_np_file(self, filename):
         if self.device.device_type == DeviceType.DISK:
             shutil.copy(filename, self.data)
         else:
-            self.load_from_np(torch.load(filename))
+            # self.load_from_np(torch.load(filename))
+            self.load_from_np(np.load(filename))
 
     def copy(self, dst, src_indices=None):
         if src_indices:
@@ -174,7 +182,6 @@ def apply_rope(x: torch.Tensor, position_embedding: tuple[torch.Tensor, torch.Te
     # sin, cos in shape (sed_len , hidden_dim)
     # x might in shape (bs, seq_len, head, hidden_dim) : unsqueeze_dim = 1
     #               or (bs, head, seq, hidden_dim):      unsqueeze_dim = 0
-
     cos, sin = position_embedding
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
@@ -211,8 +218,8 @@ class TorchDevice:
             pin_memory = True if pin_memory is None else pin_memory
         else:
             pin_memory = False
-        # dtype = np_dtype_to_torch_dtype[dtype]
-        dtype = torch.bfloat16
+        dtype = np_dtype_to_torch_dtype[dtype]
+        # dtype = torch.bfloat16
         data = torch.empty(shape, dtype=dtype, pin_memory=pin_memory, device=self.dev)
         return TorchTensor.create_from_torch(data, self, name=name)
 
@@ -310,16 +317,13 @@ class TorchDevice:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
-    def qwen_input_embed(self, inputs, w_token, donate):
+    def qwen_input_embed(self, inputs, w_token, pad_token_id, donate):
         # decompress weights
         if w_token.device.device_type == DeviceType.COMPRESSED:
             w_token = w_token.device.decompress(w_token)
-            w_pos = w_pos.device.decompress(w_pos)
 
         token_ids = inputs.data
-        mask = attention_mask.data
         if donate[0]: inputs.delete()
-        if donate[1]: attention_mask.delete()
 
         # only token-embedding, no position embeddings
         token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
@@ -351,10 +355,12 @@ class TorchDevice:
         return TorchTensor.create_from_torch(ids, self)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
-        num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+        n_qhead, n_kvhead, hidden_size, prompt_len, gen_len, gpu_batch_size = (
+            config.n_qhead, config.n_kvhead, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * n_kvhead, hidden_size // n_qhead * n_kvhead)
+
+        shape = cache_shape(config, task, policy)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
@@ -374,12 +380,13 @@ class TorchDevice:
         n_qhead, n_kvhead = n_head
         n_head = None      # in case visited later
 
-        cos, sin = position_embed
-
         b, s, h = inputs.shape
         head_dim = h // n_qhead
-        
-        scaling = head_dim ** -0.5
+
+        cos = position_embed.data[0][:s]
+        sin = position_embed.data[1][:s]
+
+        # scaling = head_dim ** -0.5
 
         hidden = rms_layernorm(inputs.data, w_ln.data)
 
@@ -393,8 +400,8 @@ class TorchDevice:
         k = k.view(b, s, n_kvhead, head_dim)
         v = v.view(b, s, n_kvhead, head_dim)
 
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        q_pos = apply_rope(q, (cos, sin))
+        k_pos = apply_rope(k, (cos, sin))
 
         # shape: (b, 1, s, s)
         idx = torch.arange(s, device=self.dev)
@@ -402,9 +409,13 @@ class TorchDevice:
         mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
 
         # attention-core
-        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+        attn_output = F.scaled_dot_product_attention(q_pos, k_pos, v, enable_gqa=True)
+        # attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+        
+        # -> (B, nhead, s, h) -> (B, s, nhead,  h) -> (B, S, H)
         attn_output = attn_output.transpose(1, 2).contiguous().view(b, s, -1)
-        attn_output = F.linear(attn_output, w_out, bias=None)
+
+        attn_output = F.linear(attn_output, w_out.data, bias=None)
         attn_output.add_(inputs.data)
 
         if donate[0]: inputs.delete()
@@ -953,10 +964,14 @@ class TorchDisk:
             os.remove(tensor.data)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
+        
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+            config.n_head, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+
+        
+
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)
         return k_cache, v_cache
@@ -1024,10 +1039,11 @@ class TorchMixedDevice:
                 x.delete()
 
     def init_cache_one_gpu_batch(self, config, task, policy):
-        num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
-            policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        # num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
+        #     config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+        #     policy.gpu_batch_size)
+        # shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        shape = cache_shape(config, task, policy)
 
         # We have to round to a multiple of `num_head`
         if policy.cache_disk_percent == 0:

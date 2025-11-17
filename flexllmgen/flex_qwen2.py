@@ -10,7 +10,7 @@ import numpy as np
 import dataclasses
 import argparse
 
-from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
+from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchTensor, 
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
@@ -139,7 +139,7 @@ class RMSNorm(nn.Module):
         return self.weight * (x / rms)
 
 
-def precompute_rope_freqs(dim: int, max_seq_len: int, theta: float, device: torch.device) :
+def precompute_rope_freqs(dim: int, max_seq_len: int, theta: float, device) :
     
     inv_freq = 1.0 / (theta** (torch.arange(0, dim, 2, device=device) / dim))
     seq = torch.arange(max_seq_len, device=device, dtype=inv_freq.dtype)
@@ -180,26 +180,30 @@ class SelfAttention:
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, self.config.dtype)
-        path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}.self_attn"))
+        head_dim = h // self.config.n_qhead
+        kv_dim = head_dim * self.config.n_kvhead
+        layer_path = os.path.join(path, f"layers.{self.layer_id}")
+        attn_path = layer_path + ".self_attn"
+
         weight_specs = [
             # w_q
-            ((h, h), dtype, path + ".q_proj.weight"),
+            ((h, h), dtype, attn_path + ".q_proj.weight"),
             # b_q
-            ((h,), dtype, path + ".q_proj.bias"),
+            ((h,), dtype, attn_path + ".q_proj.bias"),
             # w_k
-            ((h, h), dtype, path + ".k_proj.weight"),
+            ((kv_dim, h), dtype, attn_path + ".k_proj.weight"),
             # b_k
-            ((h,), dtype, path + ".k_proj.bias"),
+            ((kv_dim,), dtype, attn_path + ".k_proj.bias"),
             # w_v
-            ((h, h), dtype, path + ".v_proj.weight"),
+            ((kv_dim, h), dtype, attn_path + ".v_proj.weight"),
             # b_v
-            ((h,), dtype, path + ".v_proj.bias"),
+            ((kv_dim,), dtype, attn_path + ".v_proj.bias"),
             # w_out
-            ((h, h), dtype, path + ".out_proj.weight"),
+            ((h, h), dtype, attn_path + ".o_proj.weight"),
             # b_out, o_proj have no bias in qwen2
             # ((h,), dtype, path + ".out_proj.bias"),
             # w_ln
-            ((h,), dtype, path + "input_layernorm.weight"),
+            ((h,), dtype, layer_path + ".input_layernorm.weight"),
             # # b_ln, rms has no bias
             # ((h,), dtype, path + "_layer_norm.bias"),
         ]
@@ -207,7 +211,7 @@ class SelfAttention:
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln = weight_home.val
+        w_q, b_q, w_k, b_k, w_v, b_v, w_out, w_ln = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
@@ -332,7 +336,10 @@ class SelfAttention:
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 position_embeddings, cache_write_buf, i, k):
-        n_head = self.config.n_head
+        # n_head = self.config.n_head
+        n_qhead = self.config.n_qhead
+        n_kvhead = self.config.n_kvhead
+
 
         donate = [False] * 14   # keep 14, but idx for b_out will not be used
         # 0:hidden, 1:mask, 2-11:weight, 12:kcache, 13:vcache
@@ -358,12 +365,15 @@ class SelfAttention:
 
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+            # cos, sin = position_embeddings.val
+            # cos, donate_cos = cos.smart_copy(self.compute)
+            # sin, donate_sin = sin.smart_copy(self.compute)
             position_embed, donate[2] = position_embeddings.val.smart_copy(self.compute)
             # h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
             #     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
             #     self.policy.compress_cache, self.policy.comp_cache_config)
             h, new_k_cache, new_v_cache = self.compute.gqa(h, mask, position_embed, w_q, b_q,
-                w_k, b_k, w_v, b_v, w_out, w_ln, n_head, donate,
+                w_k, b_k, w_v, b_v, w_out, w_ln, (n_qhead, n_kvhead), donate,
                 self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
@@ -375,7 +385,7 @@ class SelfAttention:
             #     k_cache, v_cache, donate, self.policy.attn_sparsity,
             #     self.policy.compress_cache, self.policy.comp_cache_config)
             h, new_k_cache, new_v_cache = self.compute.gqa_gen(h, mask, position_embed, w_q,
-                b_q, w_k, b_k, w_v, b_v, w_out, w_ln, n_head,
+                b_q, w_k, b_k, w_v, b_v, w_out, w_ln, (n_qhead, n_kvhead),
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
@@ -473,7 +483,9 @@ class MLP:
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, self.config.dtype)
-        path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}."))
+        layer_path = os.path.join(os.path.join(path, f"layers.{self.layer_id}"))
+        mlp_path = layer_path + ".mlp"
+        
         
         intermediated_size = self.config.intermediate_size
         hidden_size = self.config.hidden_size
@@ -481,19 +493,19 @@ class MLP:
         
         weight_specs = [
             # wg
-            ((intermediated_size, hidden_size), dtype, path + "gate_proj.weight"),
+            ((intermediated_size, hidden_size), dtype, mlp_path + ".gate_proj.weight"),
             # wup
-            ((intermediated_size, hidden_size), dtype, path + "up_proj.weight"),
+            ((intermediated_size, hidden_size), dtype, mlp_path + ".up_proj.weight"),
             # wdown
-            ((hidden_size, intermediated_size), dtype, path + "down_proj.weight"),
+            ((hidden_size, intermediated_size), dtype, mlp_path + ".down_proj.weight"),
             # w_ln
-            ((hidden_size, ), dtype, path + "post_attention_layernorm")
+            ((hidden_size, ), dtype, layer_path + ".post_attention_layernorm.weight")
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_gate, w_up, w_down = weight_home.val
+        w_gate, w_up, w_down , w_ln = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
@@ -504,7 +516,8 @@ class MLP:
             weight_read_buf.store(
                 ( w_gate.smart_copy(dst1),
                 w_up.smart_copy(dst1),
-                w_down.smart_copy(dst2) )
+                w_down.smart_copy(dst2), 
+                w_ln.smart_copy(dst2) )
             )
 
     def init_cache_one_gpu_batch(self, cache_home):
@@ -640,17 +653,17 @@ class InputEmbed:
         path = os.path.join(path, "")
         weight_specs = [
             # w_token
-            ((v, h), dtype, path + "decoder.embed_tokens.weight"), 
+            ((v, h), dtype, path + "embed_tokens.weight"), 
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_token, w_pos = weight_home.val
+        w_token, = weight_home.val
         if k == 0:
             dst = self.weight_load_dst
-            weight_read_buf.store((w_token.smart_copy(dst), w_pos.smart_copy(dst)))
+            weight_read_buf.store((w_token.smart_copy(dst), ))
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -677,7 +690,8 @@ class InputEmbed:
         else:
             (w_token, _),  = weight_read_buf.val
 
-        h = self.compute.qwen_input_embed(h, w_token, donate)
+        print(f" >>> hidden in dtype: {h.data.dtype}")
+        h = self.compute.qwen_input_embed(h, w_token, self.config.pad_token_id, donate)
         hidden.val = h
 
 
@@ -701,11 +715,9 @@ class OutputEmbed:
         path = os.path.join(path, "")
         weight_specs = [
             # w_ln
-            ((h,), dtype, path + "decoder.layer_norm.weight"),
-            # b_ln
-            ((h,), dtype, path + "decoder.layer_norm.bias"),
+            ((h,), dtype, path + "norm.weight"),
             # w_token
-            ((v, h), dtype, path + "decoder.embed_tokens.weight"),
+            ((v, h), dtype, path + "embed_tokens.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
@@ -755,6 +767,8 @@ class QwenLM:
                  env: ExecutionEnv,
                  path: str,
                  policy: Policy):
+
+        # path is the current
         if isinstance(config, str):
             config = get_qwen_config(config)
         self.config = config
@@ -816,7 +830,7 @@ class QwenLM:
     def init_weight(self, j):
         expanded_path = os.path.abspath(os.path.expanduser(
             os.path.join(self.path, f"{self.config.name}-np")))
-        check_path = os.path.join(expanded_path, "decoder.embed_positions.weight")
+        check_path = os.path.join(expanded_path, "embed_tokens.weight")
         if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
             convert_qwen_weights(self.config.name, self.path)
 
@@ -959,7 +973,7 @@ class QwenLM:
         # Clear the cache_read_buf
         # Run layer computation
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
-            self.weight_read_buf[j], self.attention_mask[k], self.position_embeddings[k], 
+            self.weight_read_buf[j], self.attention_mask[k], self.position_embedding[k], 
             self.cache_write_buf[j][k], i, k)
 
     def sync(self):
@@ -976,6 +990,7 @@ class QwenLM:
             self.delete_weight(j, 0)
 
     def update_attention_mask(self, i, k):
+        # init attn mask
         if i > 0:
             mask = self.attention_mask[k]
             assert mask.val is not None
@@ -996,17 +1011,24 @@ class QwenLM:
         self.attention_mask[k].store(val)
 
     def update_position_embedding(self, i, k):
+        # init position_embed
         if i == 0:
             # positional_embedding used in attn
             attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
                 else self.env.gpu)
 
             gpu_bs = self.policy.gpu_batch_size
-            alloc_shape = (gpu_bs, self.task.prompt_len + self.task.gen_len)
-            cos = attention_compute.allocate( alloc_shape )
-            sin = attention_compute.allocate( alloc_shape )
+            head_dim = self.config.hidden_size // self.config.n_qhead
+            max_seq_len = self.task.prompt_len + self.task.gen_len
+            alloc_shape = (2, gpu_bs, max_seq_len, head_dim) # [ cos, sin ]
+            # cos_sin = attention_compute.allocate( alloc_shape , float)
+
+            cos, sin = precompute_rope_freqs(head_dim, max_seq_len, self.config.rope_theta, device=attention_compute.dev)
+            cos_sin  = torch.stack([cos, sin])
+
+            cos_sin = TorchTensor.create_from_torch(cos_sin, device=attention_compute)
             
-            self.position_embedding[k].store([cos, sin]) 
+            self.position_embedding[k].store(cos_sin) 
         # if i > 0:
         #     position_embed = self.position_embedding[k]
         #     assert position_embed.val is not None
@@ -1104,6 +1126,7 @@ class QwenLM:
             timers("generate").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
+                self.update_position_embedding(i, k)
             for j in range(self.num_layers):
                 for k in range(self.num_gpu_batches):
                     self.load_weight(i, j, k, overlap=False)
@@ -1145,6 +1168,7 @@ class QwenLM:
 
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
+                self.update_position_embedding(i, k)
 
             for j in range(self.num_layers):
                 if i > 0: timers("decoding_gpu_batch").start()
@@ -1208,6 +1232,8 @@ class QwenLM:
         for i in range(self.execute_gen_len):
             timers("generate").start()
             self.update_attention_mask(i, 0)
+            self.update_position_embedding(i, 0)
+
             for j in range(self.num_layers):
                 self.load_weight(i, j+1, 0)
                 self.load_cache(i, j+1, 0)
@@ -1233,6 +1259,7 @@ class QwenLM:
             timers("generate").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
+                self.update_position_embedding(i, k)
             for j in range(self.num_layers):
                 for k in range(self.num_gpu_batches):
                     self.load_weight(i, j+1, k)
@@ -1264,6 +1291,7 @@ class QwenLM:
         for i in range(self.execute_gen_len):
             if i == 0: timers("prefill").start()
             self.update_attention_mask(i, 0)
+            self.update_position_embedding(i, k)
             for j in range(self.num_layers):
                 if i > 0: timers("decoding_gpu_batch").start()
                 self.load_weight(i, j+1, 0)
@@ -1308,6 +1336,7 @@ class QwenLM:
             if i == 0: timers("prefill").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
+                self.update_position_embedding(i, k)
             for j in range(self.num_layers):
                 if i > 0: timers("decoding_gpu_batch").start()
                 for k in range(self.num_gpu_batches):
@@ -1582,7 +1611,6 @@ def run_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
 
     # Task and policy
-    
     if args.input_file is not None:  
         inputs = get_file_inputs(args.input_file)
         input_in_tokens = tokenizer(inputs, padding="longest").input_ids
@@ -1681,7 +1709,7 @@ def run_flexllmgen(args):
 def add_parser_arguments(parser):
     parser.add_argument("--model", type=str, default="Qwen/Qwen2-0.5B",
         help="The model name.")
-    parser.add_argument("--path", type=str, default="opt_weights",
+    parser.add_argument("--path", type=str, default="~/qwen_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexLLMGen will automatically download them from HuggingFace.")
     parser.add_argument("--offload-dir", type=str, default="flexllmgen_offload_dir",

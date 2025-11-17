@@ -30,8 +30,11 @@ class QwenConfig :
     rope_theta = 1000000.0
     bos_token_id = 151643
     eos_token_id = 151643
+    pad_token_id = 151643
     num_hidden_layers = 24
-    dtype = torch.bfloat16
+    dtype = np.float32
+    n_qhead = 14
+    n_kvhead = 2
 
     def model_bytes(self) -> int:
         h, n_layers = self.hidden_size, self.num_hidden_layers
@@ -228,33 +231,40 @@ def disable_hf_opt_init():
 
 
 def convert_qwen_weights(model_name, path):
-    model_path = "/home/llmserver/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B/snapshots/91d2aff3f957f99e4c74c962f2f408dcc88a18d8"
-    huggingface_cache =  "./huggingface_cache"
-    if not os.path.exists(huggingface_cache):
-        os.symlink(model_path, huggingface_cache)
+    # the seperated weights will be placed at path/model_name-np/
+    huggingface_cache = "/home/llmserver/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B/snapshots/91d2aff3f957f99e4c74c962f2f408dcc88a18d8"
     safetensor_files = glob.glob(os.path.join(huggingface_cache, "*.safetensors"))
 
-
     seperated_weight_dir = os.path.join(path, f"{model_name}-np")
+    seperated_weight_dir = os.path.expanduser(seperated_weight_dir)
     os.makedirs(seperated_weight_dir, exist_ok=True)
 
     import torch
 
+    print(f" >>> seperated weight dir: {seperated_weight_dir}")
     for safetensor_file in tqdm(safetensor_files, desc="Convert format"):
         state = load_file(safetensor_file)
         for name, param in tqdm(state.items(), leave=False):
             name = name.replace("model.", "")
-            name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
+            # name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
             param_path = os.path.join(seperated_weight_dir, name)
             with open(param_path, "wb") as f:
-                torch.save(param.cpu().detach(), f)
-                # save_file(param.cpu().detach(), f)
-                # np.save(f, param.cpu().detach().numpy())
+                # torch.save(param.cpu().detach(), f)
 
+                # save_file(param.cpu().detach(), f)
+                np.save(f, param.cpu().detach().to(torch.float32).numpy())
+
+    
+            with open("parameter_names.txt", "+a") as f:
+                f.write(f"{name}\n")
             # shared embedding
             # if "decoder.embed_tokens.weight" in name:
             #     shutil.copy(param_path, param_path.replace(
             #         "decoder.embed_tokens.weight", "lm_head.weight"))
+
+    seperated_weights = os.listdir(seperated_weight_dir)
+    for w in seperated_weights:
+        print(w)
 
 
 if __name__ == "__main__":
