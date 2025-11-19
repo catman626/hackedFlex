@@ -21,18 +21,20 @@ general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
 global_disk_device = None
 
-
-
-DUMP_HIDDEN = False
+DUMP_HIDDEN = True
 
 def dump_hidden(torch_obj, name, layerno=None):
     global DUMP_HIDDEN
     if DUMP_HIDDEN == False:
         return
-    save_name = f"my/{name}" if (layerno is None) \
-        else f"my/layer-{layerno}-{name}" 
-
-    print(f" >>> save {name} of layer {layerno}")
+    
+    if layerno is None:
+        save_name = f"my/{name}"
+        log_info = f" >>> save {name}"
+    else :
+        save_name = f"my/layer-{layerno}-{name}" 
+        log_info = f" >>> save {name} of layer {layerno}"
+    print(log_info)
     torch.save(torch_obj, save_name)
 
 def fix_recursive_import():
@@ -563,19 +565,19 @@ class TorchDevice:
         k_new = F.linear(hidden, w_k.data, bias=b_k.data)
         v_new = F.linear(hidden, w_v.data, bias=b_v.data)
         # -> (b, tgt_s, head, h) -> (b, head, tgt-s, h)
-        q = q.view(b, tgt_s, n_qhead, head_dim).permute(0, 2, 1, 3)
+        q =     q.view(b, tgt_s, n_qhead, head_dim).permute(0, 2, 1, 3)
         k_new = k_new.view(b, tgt_s, n_kvhead, head_dim).permute(0, 2, 1, 3)
         v_new = v_new.view(b, tgt_s, n_kvhead, head_dim).permute(0, 2, 1, 3)
 
-        q = apply_rope(q, position_embedding=(cos, sin), unsqueeze_dim=0)
-        k_new = apply_rope(k_new, (cos, sin), unsqueeze_dim=0)
+        q =     apply_rope(q,       (cos, sin), unsqueeze_dim=0)
+        k_new = apply_rope(k_new,   (cos, sin), unsqueeze_dim=0)
     
         # this part handles kv-cache
         # (src_s, b*head, h) -> (src_s, b, head, h) -> (b, head, src_s, h)
         # warning, position src_s-1 is for new kv
         k = k_cache.data[:src_s].view(-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
-        v = v_cache.data[:src_s].view(-1, b, n_kvhead, head_dim).permute(1, 2, 0,3 )
-        
+        v = v_cache.data[:src_s].view(-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+       
         k[:, :, src_s-1:src_s] = k_new
         k[:, :, src_s-1:src_s] = v_new
 

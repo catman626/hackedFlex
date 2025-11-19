@@ -595,7 +595,7 @@ class InputEmbed:
         h = self.compute.qwen_input_embed(h, w_token, self.config.pad_token_id, donate)
         hidden.val = h
 
-        dump_hidden(h.data, "my/output_embed" )
+        dump_hidden(h.data, "output_embed" )
 
 class OutputEmbed:
     def __init__(self, config, env, policy):
@@ -937,7 +937,7 @@ class QwenLM:
         #     position_embed.val = position_embed.val.device.extend_position_embedding(position_embed, )
 
     def generate(self,
-                 inputs: Union[np.array, List[List[int]]],
+                 inputs: Union[np.ndarray, List[List[int]]],
                  max_new_tokens: int = 32,
                  do_sample: bool = False,
                  temperature: float = 1.0,
@@ -945,6 +945,7 @@ class QwenLM:
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
                  verbose: int = 0):
+        # model.generate
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -1154,6 +1155,7 @@ class QwenLM:
                 break
 
     def generation_loop_overlap_multi_batch(self):
+        print(f" >>> loop overlap multi batch")
         # Prologue
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)
@@ -1274,95 +1276,11 @@ class QwenLM:
         self.delete_all_weights()
 
 
-# ------------------------------
-# 推理示例
-# ------------------------------
-# def generate(inputs: str|list[str]):
-def generate():
-    # 2, device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
-    model = Qwen2InferenceModel(qwen2_config, device)
-
-    # model 
-    model_path = "/home/llmserver/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B/snapshots/91d2aff3f957f99e4c74c962f2f408dcc88a18d8/model.safetensors"
-    model.load_from_safetensors(model_path)
-
-    # tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
-    # 确保分词器的特殊token与模型一致
-    tokenizer.bos_token_id = qwen2_config["bos_token_id"]
-    tokenizer.eos_token_id = qwen2_config["eos_token_id"]
-
-    # casual inputs
-    prompt = "Paris is the capital city of"
-    generated_text = model.generate(
-        prompt=prompt,
-        tokenizer=tokenizer,
-        max_new_tokens=50,
-        temperature=0.7
-    )
-    print(f" >>> prompt: {prompt}")
-    print(f" >>> generated: {generated_text}")
-
-
-
-
-def test_my_model():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
-    
-    # casual input_ids
-    input_ids = torch.tensor([[100, 200, 300]], device="cuda")
-
-    # my model
-    model = Qwen2InferenceModel(qwen2_config, device)
-    model.load_from_safetensors()
-    outputs, hiddens = model(input_ids, output_hiddens=True)
-    
-    
-    ref_model = Qwen2ForCausalLM.from_pretrained("Qwen/Qwen2-0.5B", device_map="auto")
-    
-    with torch.no_grad():
-        outputs = ref_model(input_ids, output_hidden_states=True)
-    
-    hidden_embed = outputs.hidden_states[0]
-    hidden_layer0 = outputs.hidden_states[1]
-
-    my_embed = hiddens["embed_tokens"]
-    my_layer0 = hiddens["layers"][0]
-
-    print(hidden_layer0)
-    
-    print("Embedding误差:", torch.norm(hidden_embed - my_embed).item())
-    print("layer0误差:", torch.norm(hidden_layer0 - my_layer0).item())
-
-    # TODO
-    # test_rope(my_model=model, ref_model=ref_model)
-
-
-def run_ref_model():
-    model_name = "Qwen/Qwen2-0.5B"
-    model = Qwen2ForCausalLM.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    prompt = "Paris is the capital city of"
-
-    input_ids = tokenizer(prompt).input_ids
-    input_ids = torch.tensor([input_ids, ])
-    output_ids = model(input_ids)
-    output_token = output_ids[:, -1:].argmax()
-
-    # output_seq = output_ids
-    output_seq = tokenizer.batch_decode(output_token)
-
-    print(output_seq)
-
 def get_env():
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
-
     return env
 
 
@@ -1381,7 +1299,7 @@ def get_policy(args):
                                       group_dim=2, symmetric=False))
     
     return policy
-
+    
 def basic_test(args):
     input_ids = [[100, 200, 300]]
 
@@ -1393,13 +1311,12 @@ def basic_test(args):
     my_model = QwenLM(config, env, args.path, policy)
 
     try:
-        outputs = my_model.generate(input_ids, max_new_tokens=1)
+        outputs = my_model.generate(input_ids, max_new_tokens=2)
     finally:
         env.close_copy_threads()
 
-    
-    
-    
+    print(outputs)
+
 
 def run_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
@@ -1442,7 +1359,6 @@ def run_flexllmgen(args):
                     CompressionConfig(num_bits=4, group_size=64,
                                       group_dim=2, symmetric=False))
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
-
     
     prompt_len = len(warmup_inputs[0])
     qwen_config = get_qwen_config(args.model)
@@ -1569,7 +1485,7 @@ if __name__ == "__main__":
 
     assert len(args.percent) == 6
 
-    run_flexllmgen(args)
+    # run_flexllmgen(args)
 
-    # basic_test(args)
+    basic_test(args)
 
