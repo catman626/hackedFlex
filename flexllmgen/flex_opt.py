@@ -1163,7 +1163,6 @@ def get_filename(args):
         percent += str(args.percent[i]) + "-"
     filename = f"fo-{model_size}-gbs{args.gpu_batch_size}-" \
                f"ngbs{args.num_gpu_batches}-" \
-               f"prompt{args.prompt_len}-" \
                f"gen{args.gen_len}-percent-{percent}"
     if args.cpu_cache_compute:
         filename += "cpu-cache"
@@ -1175,6 +1174,14 @@ def get_filename(args):
         filename += "-compc"
     return filename
 
+
+def get_compact_test_inputs(num_prompts, tokenizer):
+    # return 2d-list of int
+    prompts = ["Paris is the capital city of"]
+    input_ids = tokenizer(prompts, padding="longest").input_ids
+
+    return (input_ids[0], ) * num_prompts
+    
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
     prompts = ["Paris is the capital city of"]
