@@ -23,12 +23,18 @@ global_disk_device = None
 
 DUMP_HIDDEN = True
 DUMP_VERBOSE = False
-def dump_hidden(torch_obj, name, layerno=None):
+def dump_hidden(torch_obj, name, layerno=None, seq_len=None):
     global DUMP_HIDDEN, DUMP_VERBOSE
     if DUMP_HIDDEN == False:
         return
     
-    if layerno is None:
+    if layerno and layerno > 0:
+        return
+    
+    if seq_len is not None:
+        save_name = f"my/{name}-seq-{seq_len}"
+        log_info = f" >>> save {name} at seq-len: {seq_len}"
+    elif layerno is None:
         save_name = f"my/{name}"
         log_info = f" >>> save {name}"
     else :
@@ -53,6 +59,12 @@ def cache_shape(config, task, policy):
     shape = (prompt_len + gen_len - 1, gpu_batch_size * n_kvhead, hidden_size // n_qhead * n_kvhead)
 
     return shape
+
+def bhsd_to_cache_shape(cache):
+    b, h, s, d = cache.shape
+    c = cache.permute(2, 0, 1, 3).reshape(s, b*h, d)
+    return c
+
 
 class DeviceType(Enum):
     CPU = auto()
@@ -412,9 +424,7 @@ class TorchDevice:
         sin = position_embed.data[1][:s]
 
         dump_hidden(inputs.data, "rms-input", layerno)
-
         hidden = rms_layernorm(inputs.data, w_ln.data)
-
         dump_hidden(hidden, "attn-input", layerno)
 
         # shape: (b, s, h)
@@ -422,11 +432,12 @@ class TorchDevice:
         q = F.linear(hidden, w_q.data, bias=b_q.data) 
         k = F.linear(hidden, w_k.data, bias=b_k.data)
         v = F.linear(hidden, w_v.data, bias=b_v.data)
-        # shape: (b, s, n_head, head_dim)
+        # shape: (b, s, n_head, head_dim) -> (b, head, s, head_dim)
         q = q.view(b, s, n_qhead,  head_dim).transpose(1,2)
         k = k.view(b, s, n_kvhead, head_dim).transpose(1,2)
         v = v.view(b, s, n_kvhead, head_dim).transpose(1,2)
 
+        # (b, head, s, d)
         q_pos = apply_rope(q, (cos, sin), unsqueeze_dim=0)
         k_pos = apply_rope(k, (cos, sin), unsqueeze_dim=0)
 
@@ -457,10 +468,10 @@ class TorchDevice:
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
-        #  (b, s, n_head, head_dim) -> (s, b * n_head, head_dim)
-
-        k = k_pos.permute(1, 0, 2, 3).reshape(s, b*n_kvhead, head_dim)
-        v = v.permute(1, 0, 2, 3).reshape(s, b*n_kvhead, head_dim)
+        #  (b, n_head, s, d) -> (s, b, head, d) -> (s, b * n_head, d)
+        k = bhsd_to_cache_shape(k_pos)
+        v = bhsd_to_cache_shape(v)
+    
 
         if compress_cache:
             k = self.compressed_device.compress(k, comp_config)
@@ -566,30 +577,37 @@ class TorchDevice:
         # this part prepares new qkv for sdpa
         # -> (b, tgt_s, H)
         q = F.linear(hidden, w_q.data, bias=b_q.data) 
-        k_new = F.linear(hidden, w_k.data, bias=b_k.data)
-        v_new = F.linear(hidden, w_v.data, bias=b_v.data)
+        k1 = F.linear(hidden, w_k.data, bias=b_k.data)
+        v1 = F.linear(hidden, w_v.data, bias=b_v.data)
         # -> (b, tgt_s, head, h) -> (b, head, tgt-s, h)
-        q =     q.view(b, tgt_s, n_qhead, head_dim).permute(0, 2, 1, 3)
-        k_new = k_new.view(b, tgt_s, n_kvhead, head_dim).permute(0, 2, 1, 3)
-        v_new = v_new.view(b, tgt_s, n_kvhead, head_dim).permute(0, 2, 1, 3)
+        q =  q.view(    b, tgt_s, n_qhead,  head_dim).permute(0, 2, 1, 3)
+        k1 = k1.view(   b, tgt_s, n_kvhead, head_dim).permute(0, 2, 1, 3)
+        v1 = v1.view(   b, tgt_s, n_kvhead, head_dim).permute(0, 2, 1, 3)
 
-        dump_hidden(k_new, "k_new", layerno)
+        dump_hidden(k1, "k_new", layerno)
         dump_hidden(q, "q", layerno)
 
-        q_pos =     apply_rope(q,       (cos, sin), unsqueeze_dim=0)
-        k_new_pos = apply_rope(k_new,   (cos, sin), unsqueeze_dim=0)
+        q_pos  = apply_rope(q,       (cos, sin), unsqueeze_dim=0)
+        k1_pos = apply_rope(k1,   (cos, sin), unsqueeze_dim=0)
 
-        dump_hidden(k_new_pos, "k_pos", layerno)
+        k1_cache = k1_pos
+        v1_cache = v1
+
+        dump_hidden(k1_pos, "k_pos", layerno)
         dump_hidden(q_pos, "q_pos", layerno)
 
         # this part handles kv-cache
         # (src_s, b*head, h) -> (src_s, b, head, h) -> (b, head, src_s, h)
         # warning, position src_s-1 is for new kv
-        k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
-        v = v_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+        k = k_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+        v = v_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+        
+        dump_hidden(k, f"load-k", layerno, src_s-1)
+        k = torch.concat([k, k1_pos], dim=2)
+        v = torch.concat([v,v1], dim=2)
        
-        k[:, :, src_s-1:src_s] = k_new_pos
-        v[:, :, src_s-1:src_s] = v_new
+        k[:, :, src_s-1:src_s, :] = k1_pos
+        v[:, :, src_s-1:src_s, :] = v1
 
         dump_hidden(k, "k", layerno)
         dump_hidden(v, "v", layerno)
@@ -609,24 +627,26 @@ class TorchDevice:
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
-        # (b, head, tgt_s, h) -> ... -> (tgt_s, b*head, h)
+        dump_hidden(k1_cache, "store-k", layerno, src_s-1)
+        dump_hidden(v1_cache, "store-v", layerno, src_s-1)
+
         # (b, head, tgt_s, h) -> (tgt_s, b, head, h) -> (tgt_s, b*head, h)
-        k_store= k_new_pos.permute(0, 2, 1, 3).reshape(tgt_s, b*n_kvhead, head_dim)
-        v_store = v_new.permute(0, 2, 1, 3).reshape(tgt_s, b*n_kvhead, head_dim)
+        k1_cache = bhsd_to_cache_shape(k1_cache)
+        v1_cache = bhsd_to_cache_shape(v1_cache)
 
         if compress_cache:
             assert 0
             if comp_config.group_dim == 0:
                 s_ = src_s // comp_config.group_size * comp_config.group_size
-                k_store = k[:, :, s_:].permute(2, 0, 1)
-                v_store = v[:, s_:, :].permute(1, 0, 2)
-            k_store = self.compressed_device.compress(k_store, comp_config)
-            v_store = self.compressed_device.compress(v_store, comp_config)
+                k1_cache = k[:, :, s_:].permute(2, 0, 1)
+                v1_store = v[:, s_:, :].permute(1, 0, 2)
+            k1_store = self.compressed_device.compress(k1_cache, comp_config)
+            v1_store = self.compressed_device.compress(v1_store, comp_config)
         else:
-            k_store = TorchTensor.create_from_torch(k_store, self)
-            v_store = TorchTensor.create_from_torch(v_store, self)
+            k1_cache = TorchTensor.create_from_torch(k1_cache, self)
+            v1_cache = TorchTensor.create_from_torch(v1_cache, self)
 
-        return TorchTensor.create_from_torch(value, self), k_store, v_store
+        return TorchTensor.create_from_torch(value, self), k1_cache, v1_cache
 
     def mha_gen(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
                 w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,

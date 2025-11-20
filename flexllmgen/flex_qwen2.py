@@ -301,7 +301,6 @@ class SelfAttention:
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
         
-        # print(f" >>> cache home in shape: {k_home.data.shape}")
 
         if i == self.task.gen_len - 1:  # last token, no need to store cache
             return
@@ -363,7 +362,7 @@ class SelfAttention:
                 self.policy.compress_cache, self.policy.comp_cache_config, self.layer_id)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
-            dump_hidden(h.data, self.layer_id, "attn-output")
+            dump_hidden(h.data,  "attn-output", self.layer_id)
             # torch.save(h.data, f"my/layer-{self.layer_id}-attn-output")
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
@@ -476,7 +475,7 @@ class MLP:
         h = self.compute.qwen_mlp(h, w_gate, w_up, w_down, w_ln, donate, self.layer_id)
         hidden.val = h
 
-        dump_hidden(h.data, self.layer_id, "final")
+        dump_hidden(h.data, "final" , self.layer_id)
 
 class TransformerLayer:
     def __init__(self, config, env, policy, i):
@@ -594,7 +593,7 @@ class InputEmbed:
         h = self.compute.qwen_input_embed(h, w_token, self.config.pad_token_id, donate)
         hidden.val = h
 
-        dump_hidden(h.data, "output_embed" )
+        # dump_hidden(h.data, "output_embed" )
 
 class OutputEmbed:
     def __init__(self, config, env, policy):
