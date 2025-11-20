@@ -24,8 +24,6 @@ from flexllmgen.compression import CompressionConfig
 from flexllmgen.flex_opt import init_weight_list, get_compact_test_inputs, get_file_inputs, get_test_inputs, get_filename
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
-OUTPUT_HIDDEN = True
-mlp_layerno = 0
 
 @dataclasses.dataclass(frozen=True)
 class Policy:
@@ -316,6 +314,7 @@ class SelfAttention:
             indices = (slice(pos - k_new.shape[0], pos),
                        slice(0, k_new.shape[1]))
 
+        # print(f" >>> indices: {indices}")
         # print(f" >>> store-cache at decoding step {i}")
         # print(f" >>> store cache indices: {indices}")
         general_copy(k_home, indices, k_new, None)
@@ -1301,7 +1300,8 @@ def get_policy(args):
     return policy
     
 def basic_test(args):
-    input_ids = [[100, 200, 300]]
+    input_ids = [[100, 200, 300, ]]
+    # input_ids = [[100, 200, 300, 279, 1156]]
 
     policy = get_policy(args)
     config = get_qwen_config(args.model)
@@ -1311,7 +1311,7 @@ def basic_test(args):
     my_model = QwenLM(config, env, args.path, policy)
 
     try:
-        outputs = my_model.generate(input_ids, max_new_tokens=2)
+        outputs = my_model.generate(input_ids, max_new_tokens=args.gen_len)
     finally:
         env.close_copy_threads()
 
@@ -1440,7 +1440,7 @@ def add_parser_arguments(parser):
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")
     parser.add_argument("--debug-mode", type=str,
-        choices=["fewer_batch", "breakdown", "output_hidden"])
+        choices=["fewer_batch", "breakdown", "output_hidden", "basic"])
     parser.add_argument("--gpu-batch-size", type=int, default=4)
     parser.add_argument("--num-gpu-batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
@@ -1485,7 +1485,9 @@ if __name__ == "__main__":
 
     assert len(args.percent) == 6
 
-    # run_flexllmgen(args)
+    if args.debug_mode == "basic":
+        basic_test(args)
+    else:
+        run_flexllmgen(args)
 
-    basic_test(args)
 

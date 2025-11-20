@@ -22,9 +22,9 @@ global_cpu_device = None
 global_disk_device = None
 
 DUMP_HIDDEN = True
-
+DUMP_VERBOSE = False
 def dump_hidden(torch_obj, name, layerno=None):
-    global DUMP_HIDDEN
+    global DUMP_HIDDEN, DUMP_VERBOSE
     if DUMP_HIDDEN == False:
         return
     
@@ -34,7 +34,10 @@ def dump_hidden(torch_obj, name, layerno=None):
     else :
         save_name = f"my/layer-{layerno}-{name}" 
         log_info = f" >>> save {name} of layer {layerno}"
-    print(log_info)
+
+    if DUMP_VERBOSE:
+        print(log_info)
+
     torch.save(torch_obj, save_name)
 
 def fix_recursive_import():
@@ -339,6 +342,7 @@ class TorchDevice:
 
         # only token-embedding, no position embeddings
         token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
+
         dump_hidden(token_embed, "embed_tokens")
 
         return TorchTensor.create_from_torch(token_embed, self)
@@ -437,7 +441,7 @@ class TorchDevice:
         # attention-core
         attn_output = F.scaled_dot_product_attention(q_pos, k_pos, v, attn_mask=mask, enable_gqa=True)
 
-        dump_hidden(attn_output, "sdpa", layerno)
+        dump_hidden(attn_output, "sdpa", layerno)   # in shape (b, head, s, h)
         
         # -> (B, nhead, s, h) -> (B, s, nhead,  h) -> (B, S, H)
         attn_output = attn_output.transpose(1, 2).contiguous().view(b, s, -1)
@@ -454,7 +458,8 @@ class TorchDevice:
         if donate[1]: attention_mask.delete()
 
         #  (b, s, n_head, head_dim) -> (s, b * n_head, head_dim)
-        k = k.permute(1, 0, 2, 3).reshape(s, b*n_kvhead, head_dim)
+
+        k = k_pos.permute(1, 0, 2, 3).reshape(s, b*n_kvhead, head_dim)
         v = v.permute(1, 0, 2, 3).reshape(s, b*n_kvhead, head_dim)
 
         if compress_cache:
@@ -465,7 +470,6 @@ class TorchDevice:
             v = TorchTensor.create_from_torch(v, self)
 
 
-        layerno += 1
         return TorchTensor.create_from_torch(attn_output, self), k, v
     
 
@@ -554,8 +558,8 @@ class TorchDevice:
         n_qhead, n_kvhead = n_head
         head_dim = h // n_qhead
 
-        cos = position_embed.data[0][src_s:src_s+1]
-        sin = position_embed.data[1][src_s:src_s+1]
+        cos = position_embed.data[0][src_s-1:src_s]
+        sin = position_embed.data[1][src_s-1:src_s]
 
         hidden = rms_layernorm(inputs.data, w_ln.data)
 
@@ -569,54 +573,60 @@ class TorchDevice:
         k_new = k_new.view(b, tgt_s, n_kvhead, head_dim).permute(0, 2, 1, 3)
         v_new = v_new.view(b, tgt_s, n_kvhead, head_dim).permute(0, 2, 1, 3)
 
-        q =     apply_rope(q,       (cos, sin), unsqueeze_dim=0)
-        k_new = apply_rope(k_new,   (cos, sin), unsqueeze_dim=0)
-    
+        dump_hidden(k_new, "k_new", layerno)
+        dump_hidden(q, "q", layerno)
+
+        q_pos =     apply_rope(q,       (cos, sin), unsqueeze_dim=0)
+        k_new_pos = apply_rope(k_new,   (cos, sin), unsqueeze_dim=0)
+
+        dump_hidden(k_new_pos, "k_pos", layerno)
+        dump_hidden(q_pos, "q_pos", layerno)
+
         # this part handles kv-cache
         # (src_s, b*head, h) -> (src_s, b, head, h) -> (b, head, src_s, h)
         # warning, position src_s-1 is for new kv
-        k = k_cache.data[:src_s].view(-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
-        v = v_cache.data[:src_s].view(-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+        k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+        v = v_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
        
-        k[:, :, src_s-1:src_s] = k_new
-        k[:, :, src_s-1:src_s] = v_new
+        k[:, :, src_s-1:src_s] = k_new_pos
+        v[:, :, src_s-1:src_s] = v_new
 
-        # output: (b, head, s, h)
-        
-        # value = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
-        # print(f" >>> mask in shape: {attention_mask.shape}")
-        
+        dump_hidden(k, "k", layerno)
+        dump_hidden(v, "v", layerno)
+
         # mask: (B, S) -> (B, 1, 1, S)
         mask = attention_mask.data.view(b, 1, 1, -1)
-        value = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+        value = F.scaled_dot_product_attention(q_pos, k, v, attn_mask=mask, enable_gqa=True)
+        
+        dump_hidden(value, "sdpa", layerno=layerno)
 
         # -> (b, s, head, h) -> (b, s, H)
         value = value.permute(0, 2, 1, 3).view(b, tgt_s, h)
         value = F.linear(value, w_out.data, bias=None)
 
         value.add_(inputs.data)
-        # shape: (b, 1, h)
 
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
         # (b, head, tgt_s, h) -> ... -> (tgt_s, b*head, h)
         # (b, head, tgt_s, h) -> (tgt_s, b, head, h) -> (tgt_s, b*head, h)
-        k_new = k_new.permute(0, 2, 1, 3).reshape(tgt_s, b*n_kvhead, head_dim)
-        v_new = v_new.permute(0, 2, 1, 3).reshape(tgt_s, b*n_kvhead, head_dim)
+        k_store= k_new_pos.permute(0, 2, 1, 3).reshape(tgt_s, b*n_kvhead, head_dim)
+        v_store = v_new.permute(0, 2, 1, 3).reshape(tgt_s, b*n_kvhead, head_dim)
 
         if compress_cache:
+            assert 0
             if comp_config.group_dim == 0:
                 s_ = src_s // comp_config.group_size * comp_config.group_size
-                k_new = k[:, :, s_:].permute(2, 0, 1)
-                v_new = v[:, s_:, :].permute(1, 0, 2)
-            k_new = self.compressed_device.compress(k_new, comp_config)
-            v_new = self.compressed_device.compress(v_new, comp_config)
+                k_store = k[:, :, s_:].permute(2, 0, 1)
+                v_store = v[:, s_:, :].permute(1, 0, 2)
+            k_store = self.compressed_device.compress(k_store, comp_config)
+            v_store = self.compressed_device.compress(v_store, comp_config)
         else:
-            k_new = TorchTensor.create_from_torch(k_new, self)
-            v_new = TorchTensor.create_from_torch(v_new, self)
+            k_store = TorchTensor.create_from_torch(k_store, self)
+            v_store = TorchTensor.create_from_torch(v_store, self)
 
-        return TorchTensor.create_from_torch(value, self), k_new, v_new
+        return TorchTensor.create_from_torch(value, self), k_store, v_store
 
     def mha_gen(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
                 w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
