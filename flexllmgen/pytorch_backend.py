@@ -423,6 +423,8 @@ class TorchDevice:
         cos = position_embed.data[0][:s]
         sin = position_embed.data[1][:s]
 
+        dump_hidden(cos, "cos", layerno)
+        
         dump_hidden(inputs.data, "rms-input", layerno)
         hidden = rms_layernorm(inputs.data, w_ln.data)
         dump_hidden(hidden, "attn-input", layerno)
@@ -596,7 +598,7 @@ class TorchDevice:
         dump_hidden(k1_pos, "k_pos", layerno)
         dump_hidden(q_pos, "q_pos", layerno)
 
-        # this part handles kv-cache
+        # kv-cache
         # (src_s, b*head, h) -> (src_s, b, head, h) -> (b, head, src_s, h)
         # warning, position src_s-1 is for new kv
         k = k_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)

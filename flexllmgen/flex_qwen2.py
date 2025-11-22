@@ -1424,8 +1424,6 @@ def run_flexllmgen(args):
     if args.verbose >= 1:
         print(log_str)
 
-
-
 def add_parser_arguments(parser):
     parser.add_argument("--model", type=str, default="Qwen/Qwen2-0.5B",
         help="The model name.")
@@ -1461,7 +1459,6 @@ def add_parser_arguments(parser):
         help="Whether to compress weight.")
     parser.add_argument("--compress-cache", action="store_true",
         help="Whether to compress cache.")
-
 
     parser.add_argument("--log-file", type=str, default="auto")
     parser.add_argument("--no-log", action="store_true")
