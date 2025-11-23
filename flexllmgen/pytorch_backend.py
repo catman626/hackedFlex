@@ -603,12 +603,15 @@ class TorchDevice:
             # kv-cache
             # (src_s, b*head, h) -> (src_s, b, head, h) -> (b, head, src_s, h)
             # warning, position src_s-1 is for new kv
-            k = k_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
-            v = v_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+            # k = k_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+            # v = v_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
             
+            k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+            v = v_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+
             dump_hidden(k, f"load-k", layerno, src_s-1)
-            k = torch.concat([k, k1_pos], dim=2)
-            v = torch.concat([v,v1], dim=2)
+            # k = torch.concat([k, k1_pos], dim=2)
+            # v = torch.concat([v,v1], dim=2)
         
             k[:, :, src_s-1:src_s, :] = k1_pos
             v[:, :, src_s-1:src_s, :] = v1
