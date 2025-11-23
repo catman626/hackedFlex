@@ -559,7 +559,15 @@ class TorchDevice:
                    q, k_new, v_new, 
                    k_cache, v_cache, 
                    attention_mask, 
-                   src_s, b, n_kvhead, head_dim, layerno):
+                   layerno):
+        """
+        new q, k, v in shape (b, head, s, h)
+
+        return : (b, head, s, h)
+        """
+        src_s = attention_mask.shape[-1]
+        b, n_qhead, tgt_s, head_dim = q.shape
+        n_kvhead = k_new.shape[1]
         k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
         v = v_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
 
@@ -629,7 +637,7 @@ class TorchDevice:
             value = self._gqa_value(q_pos, k1_pos, v1, 
                                     k_cache, v_cache, 
                                     attention_mask, 
-                                    src_s, b, n_kvhead, head_dim, layerno)
+                                    layerno)
 
             dump_hidden(value, "sdpa", layerno=layerno)
 
