@@ -8,13 +8,11 @@ import argparse
 import dataclasses
 import glob
 import os
-import shutil
 
 import numpy as np
 from tqdm import tqdm
 
 from safetensors.torch import load_file, load, save_file
-import torch
 
 
 @dataclasses.dataclass(frozen=True)
@@ -23,18 +21,17 @@ class QwenConfig :
     hidden_size = 896
     num_attention_heads = 14
     num_key_value_heads = 2
+
     intermediate_size = 4864
     max_position_embeddings = 131072
+    num_hidden_layers = 24
     rms_norm_eps = 1e-6
     rope_theta = 1000000.0
     vocab_size = 151936
     bos_token_id = 151643
     eos_token_id = 151643
     pad_token_id = 151643
-    num_hidden_layers = 24
     dtype = np.float32
-    n_qhead = 14
-    n_kvhead = 2
 
     def model_bytes(self) -> int:
         h, n_layers = self.hidden_size, self.num_hidden_layers
@@ -60,8 +57,18 @@ class QwenConfig :
 
 
 def get_qwen_config(name):
-    assert name == "Qwen/Qwen2-0.5B"
-    return QwenConfig()
+    if "/" in name:
+        name = name.split("/")[-1]
+    name = name.lower()
+
+    if name == "qwen2-0.5b":
+        return QwenConfig()
+    elif name == "qwen2-7b":
+        config = QwenConfig(
+            name=name, hidden_size=3584, intermediate_size=18944,
+            num_attention_heads = 14, num_hidden_layers = 24, num_key_value_heads = 2
+        )
+        return config
 
 def get_opt_config(name, **kwargs):
     if "/" in name:

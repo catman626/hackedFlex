@@ -55,7 +55,7 @@ def fix_recursive_import():
 
 def cache_shape(config, task, policy):
     n_qhead, n_kvhead, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-        config.n_qhead, config.n_kvhead, config.hidden_size, task.prompt_len, task.gen_len,
+        config.num_attention_heads, config.num_key_value_heads, config.hidden_size, task.prompt_len, task.gen_len,
         policy.gpu_batch_size)
     shape = (prompt_len + gen_len - 1, gpu_batch_size * n_kvhead, hidden_size // n_qhead * n_kvhead)
 
@@ -421,7 +421,7 @@ class TorchDevice:
 
         elif config.name.startswith("Qwen"):
             n_qhead, n_kvhead, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-                config.n_qhead, config.n_kvhead, config.hidden_size, task.prompt_len, task.gen_len,
+                config.num_attention_heads, config.num_key_value_heads, config.hidden_size, task.prompt_len, task.gen_len,
                 policy.gpu_batch_size)
         
             shape = (prompt_len + gen_len - 1, gpu_batch_size * n_kvhead, hidden_size // n_qhead)
@@ -1131,7 +1131,7 @@ class TorchDisk:
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         n_qhead, n_kvhead, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_qhead, config.n_kvhead, config.hidden_size, task.prompt_len, task.gen_len,
+            config.num_attention_heads, config.num_key_value_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         
         shape = (prompt_len + gen_len - 1, gpu_batch_size * n_kvhead, hidden_size // n_qhead)

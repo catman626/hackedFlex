@@ -164,8 +164,8 @@ class SelfAttention:
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, self.config.dtype)
-        head_dim = h // self.config.n_qhead
-        kv_dim = head_dim * self.config.n_kvhead
+        head_dim = h // self.config.num_attention_heads
+        kv_dim = head_dim * self.config.num_key_value_heads
         layer_path = os.path.join(path, f"layers.{self.layer_id}")
         attn_path = layer_path + ".self_attn"
 
@@ -325,8 +325,8 @@ class SelfAttention:
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 position_embeddings, cache_write_buf, i, k):
         # n_head = self.config.n_head
-        n_qhead = self.config.n_qhead
-        n_kvhead = self.config.n_kvhead
+        n_qhead = self.config.num_attention_heads
+        n_kvhead = self.config.num_key_value_heads
 
 
         donate = [False] * 14   # keep 14, but idx for b_out will not be used
@@ -918,7 +918,7 @@ class QwenLM:
                 else self.env.gpu)
 
             gpu_bs = self.policy.gpu_batch_size
-            head_dim = self.config.hidden_size // self.config.n_qhead
+            head_dim = self.config.hidden_size // self.config.num_attention_heads
             max_seq_len = self.task.prompt_len + self.task.gen_len
             alloc_shape = (2, gpu_bs, max_seq_len, head_dim) # [ cos, sin ]
             # cos_sin = attention_compute.allocate( alloc_shape , float)
