@@ -598,33 +598,35 @@ class TorchDevice:
         dump_hidden(k1_pos, "k_pos", layerno)
         dump_hidden(q_pos, "q_pos", layerno)
 
-        # kv-cache
-        # (src_s, b*head, h) -> (src_s, b, head, h) -> (b, head, src_s, h)
-        # warning, position src_s-1 is for new kv
-        k = k_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
-        v = v_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+        # gqa-gen-sparse
+        if attn_sparsity >= 1.0:
+            # kv-cache
+            # (src_s, b*head, h) -> (src_s, b, head, h) -> (b, head, src_s, h)
+            # warning, position src_s-1 is for new kv
+            k = k_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+            v = v_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+            
+            dump_hidden(k, f"load-k", layerno, src_s-1)
+            k = torch.concat([k, k1_pos], dim=2)
+            v = torch.concat([v,v1], dim=2)
         
-        dump_hidden(k, f"load-k", layerno, src_s-1)
-        k = torch.concat([k, k1_pos], dim=2)
-        v = torch.concat([v,v1], dim=2)
-       
-        k[:, :, src_s-1:src_s, :] = k1_pos
-        v[:, :, src_s-1:src_s, :] = v1
+            k[:, :, src_s-1:src_s, :] = k1_pos
+            v[:, :, src_s-1:src_s, :] = v1
 
-        dump_hidden(k, "k", layerno)
-        dump_hidden(v, "v", layerno)
+            dump_hidden(k, "k", layerno)
+            dump_hidden(v, "v", layerno)
 
-        # mask: (B, S) -> (B, 1, 1, S)
-        mask = attention_mask.data.view(b, 1, 1, -1)
-        value = F.scaled_dot_product_attention(q_pos, k, v, attn_mask=mask, enable_gqa=True)
-        
-        dump_hidden(value, "sdpa", layerno=layerno)
+            # mask: (B, S) -> (B, 1, 1, S)
+            mask = attention_mask.data.view(b, 1, 1, -1)
+            value = F.scaled_dot_product_attention(q_pos, k, v, attn_mask=mask, enable_gqa=True)
+            
+            dump_hidden(value, "sdpa", layerno=layerno)
 
-        # -> (b, s, head, h) -> (b, s, H)
-        value = value.permute(0, 2, 1, 3).view(b, tgt_s, h)
-        value = F.linear(value, w_out.data, bias=None)
+            # -> (b, s, head, h) -> (b, s, H)
+            value = value.permute(0, 2, 1, 3).view(b, tgt_s, h)
+            value = F.linear(value, w_out.data, bias=None)
 
-        value.add_(inputs.data)
+            value.add_(inputs.data)
 
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
@@ -636,6 +638,7 @@ class TorchDevice:
         k1_cache = bhsd_to_cache_shape(k1_cache)
         v1_cache = bhsd_to_cache_shape(v1_cache)
 
+        # cache compression related
         if compress_cache:
             assert 0
             if comp_config.group_dim == 0:
@@ -711,6 +714,7 @@ class TorchDevice:
                     value = self._attention_value(q, k, v, attention_mask.data,
                         b, src_s, tgt_s, n_head, head_dim).cuda().half()
             else:  # Sparse attention
+                # gen-sparse
                 # shape: (s, b * n_head, head_dim)
                 k = k_cache.data[:src_s]
                 k[src_s - 1:src_s] = k_new
@@ -755,7 +759,10 @@ class TorchDevice:
         return TorchTensor.create_from_torch(value, self), k_new, v_new
 
     def _attention_weights(self, q, k, mask, b, src_s, n_head):
+        # calculate masked attn-score(include softmax)
+        # scaling done, "k" is kt
         # shape: (b * n_head, 1, s)
+        # return (b*head, 1, s)
         attn_weights = torch.bmm(q, k)
         # shape: (b, 1, 1, s)
         mask = mask.view(b, 1, 1, src_s)
@@ -764,6 +771,25 @@ class TorchDevice:
         attn_weights = torch.where(mask, attn_weights, -1e4)
         attn_weights = attn_weights.view(b * n_head, 1, src_s)
         attn_weights = F.softmax(attn_weights, dim=2)
+        return attn_weights
+
+    def _gqa_attention_weights(self, q, k, mask, b, src_s, n_qhead, n_kvhead):
+        """
+        q in shape (b, n_qhead, src_s, h)  
+        k in shape (b, n_kvhead,src_s, h)  
+        ret: (b, nqhead, 1, src_s)
+        """
+        k1 = k.repeat_interleave(n_qhead//n_kvhead, dim=1)
+        mask = mask.view(b, 1, 1, src_s)
+        
+        # -> (b*nqhead, src_s)
+        attn_weights = torch.bmm(
+            q.view(b*n_qhead, 1, -1),
+            k1.view(b*n_qhead, src_s, -1).T
+        )
+        attn_weights = attn_weights.view(b, n_qhead, 1, -1)
+        attn_weights = attn_weights.where(mask, -1e4)
+        attn_weights = F.softmax(attn_weights, dim=-1)
         return attn_weights
 
     def _attention_value(self, q, k, v, mask, b, src_s, tgt_s, n_head, head_dim):
@@ -805,6 +831,52 @@ class TorchDevice:
 
         # shape: (b * n_head, 1, head_dim)
         return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
+
+    def _sparse_gqa_attention_value(self, q, k, v_new, v_cache, mask, b,
+                                src_s, tgt_s, n_qhead, n_kvhead, head_dim, attn_sparsity):
+        # shape: (b, n_head, 1, s)
+        attn_weights = self._gqa_attention_weights(q, k, mask, b, src_s, n_qhead, n_kvhead)
+        topk = int(attn_sparsity * (attn_weights.shape[2] - 1))
+        topk_weights, topk_indices = attn_weights[:, :, :, :-1].topk(
+            topk, dim=3, sorted=False)
+        # (b, head, 1, k) -> (b* ngroup, group_head* k)
+        group_head = n_qhead // n_kvhead
+        topk_indices = topk_indices.view(b * n_kvhead, group_head * topk).T
+
+        # shape: (b, n_head, 1, topk+1)
+        attn_weights = torch.cat([topk_weights,
+            attn_weights[:, :, :, -1:]], dim=-1)
+
+        if k.is_cuda:
+            v_home = v_cache
+            v_buf = self.allocate((group_head *(topk+1), b*n_kvhead, head_dim), np.float16)
+            topk_indices = topk_indices.cpu()
+        else:
+            (v_home, v_buf) = v_cache
+
+        # shape: (s, b * n_head, head_dim)
+        indices_src = topk_indices
+        indices_tgt = (slice(0, indices_src.shape[0]), slice(0, v_home.shape[1]))
+        general_copy(v_buf, indices_tgt, v_home, indices_src)
+        v_home.device.synchronize()
+
+        # shape: (topk+1, b * n_head, head_dim)
+        v = v_buf.data[:group_head*(topk+1)]
+        
+        # remember: topk_indices = topk_indices.view(b * n_kvhead, group_head * topk).T
+        # -> (b, n_kvhead, group_head, topk+1, h)
+        v = v.view( group_head*(topk+1), (b* n_kvhead), head_dim).permute(0,1)
+        # -> (b, nqhead, topk , h) topk is s
+        v = v.view( b, n_kvhead*group_head, topk+1, head_dim)
+        
+        v[:, :, topk:topk+1] = v_new
+        # shape: (b * n_head, topk+1, head_dim)
+        v = v.reshape(b * n_qhead, topk+1, head_dim)
+
+        # shape: (b * n_head, 1, head_dim)
+        return torch.bmm(
+            attn_weights.view(b, n_qhead, 1, topk+1),
+            v).view(b, n_qhead, tgt_s, head_dim)
 
     def _mixed_device_attention(self, q, k_cache, v_cache, k_new, v_new,
             mask, b, src_s, tgt_s, n_head, head_dim):
