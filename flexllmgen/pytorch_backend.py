@@ -60,6 +60,11 @@ def cache_shape(config, task, policy):
 
     return shape
 
+def extract_cache_to_bhsd(cache, b, n_head, s, d):
+    return cache.data[:s].view(s, b, n_head, d).permute(1,2,0,3)
+  
+    # k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+
 def bhsd_to_cache_shape(cache):
     b, h, s, d = cache.shape
     c = cache.permute(2, 0, 1, 3).reshape(s, b*h, d)
@@ -568,8 +573,11 @@ class TorchDevice:
         src_s = attention_mask.shape[-1]
         b, n_qhead, tgt_s, head_dim = q.shape
         n_kvhead = k_new.shape[1]
-        k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
-        v = v_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+        k = extract_cache_to_bhsd(k_cache, b, n_kvhead, src_s, head_dim)
+        v = extract_cache_to_bhsd(v_cache, b, n_kvhead, src_s, head_dim)
+        
+        # k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
+        # v = v_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
 
         dump_hidden(k, f"load-k", layerno, src_s-1)
     
@@ -634,18 +642,23 @@ class TorchDevice:
             # warning, position src_s-1 is for new kv
             # k = k_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
             # v = v_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
-            value = self._gqa_value(q_pos, k1_pos, v1, 
+            attn_value = self._gqa_value(q_pos, k1_pos, v1, 
                                     k_cache, v_cache, 
                                     attention_mask, 
                                     layerno)
 
-            dump_hidden(value, "sdpa", layerno=layerno)
+        else:
+            attn_value = self._sparse_gqa_value(q_pos, k1_pos, v1, 
+                                                k_cache, v_cache, attention_mask,
+                                                layerno)
+            
+        dump_hidden(attn_value, "sdpa", layerno=layerno)
 
-            # -> (b, s, head, h) -> (b, s, H)
-            value = value.permute(0, 2, 1, 3).view(b, tgt_s, h)
-            value = F.linear(value, w_out.data, bias=None)
+        # -> (b, s, head, h) -> (b, s, H)
+        value = attn_value.permute(0, 2, 1, 3).view(b, tgt_s, h)
+        value = F.linear(value, w_out.data, bias=None)
 
-            value.add_(inputs.data)
+        value.add_(inputs.data)
 
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
@@ -794,8 +807,7 @@ class TorchDevice:
 
     def _gqa_attention_weights(self, q, k, mask, b, src_s, n_qhead, n_kvhead):
         """
-        q in shape (b, n_qhead, src_s, h)  
-        k in shape (b, n_kvhead,src_s, h)  
+        q,k in shape (b, n_qhead, src_s, h)  
         ret: (b, nqhead, 1, src_s)
         """
         k1 = k.repeat_interleave(n_qhead//n_kvhead, dim=1)
@@ -851,10 +863,24 @@ class TorchDevice:
         # shape: (b * n_head, 1, head_dim)
         return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
 
-    def _sparse_gqa_attention_value(self, q, k, v_new, v_cache, mask, b,
-                                src_s, tgt_s, n_qhead, n_kvhead, head_dim, attn_sparsity):
+    def _sparse_gqa_value(self, q, k_new, v_new, 
+                          k_cache, v_cache, 
+                          mask, 
+                          attn_sparsity, layerno):
+        """
+        q, k, v: (b, head, s, h)
+        """
+        b, tgt_s, n_qhead, head_dim = q.shape
+        src_s = mask.shape[-1]
+        n_kvhead = k_new.shape[1]
+
+        #get kcache
+        k = k_cache.data[src_s]
+
+        # attn-score
+        
         # shape: (b, n_head, 1, s)
-        attn_weights = self._gqa_attention_weights(q, k, mask, b, src_s, n_qhead, n_kvhead)
+        attn_weights = self._gqa_attention_weights(q, k_new, mask, b, src_s, n_qhead, n_kvhead)
         topk = int(attn_sparsity * (attn_weights.shape[2] - 1))
         topk_weights, topk_indices = attn_weights[:, :, :, :-1].topk(
             topk, dim=3, sorted=False)
