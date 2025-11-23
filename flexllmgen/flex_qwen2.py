@@ -964,6 +964,7 @@ class QwenLM:
         self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
             self.config.pad_token_id, dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
+        print(f" >>> shape of output_ids: {self.output_ids.shape}")
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
         assert gpu_batch_size * num_gpu_batches == len(task.inputs)
 
@@ -1332,8 +1333,8 @@ def run_flexllmgen(args):
 
     # Task and policy
     if args.input_file is not None:  
-        inputs = get_file_inputs(args.input_file)
-        input_in_tokens = tokenizer(inputs, padding="longest").input_ids
+        input_in_tokens = get_file_inputs(args.input_file, num_prompts, tokenizer)
+        # input_in_tokens = tokenizer(inputs, padding="longest").input_ids
     else:
         input_in_tokens = get_compact_test_inputs(num_prompts, tokenizer)
 

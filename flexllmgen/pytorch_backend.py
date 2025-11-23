@@ -21,7 +21,8 @@ general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
 global_disk_device = None
 
-DUMP_HIDDEN = True
+DUMP_HIDDEN = False
+# DUMP_HIDDEN = True
 DUMP_VERBOSE = False
 def dump_hidden(torch_obj, name, layerno=None, seq_len=None):
     global DUMP_HIDDEN, DUMP_VERBOSE
@@ -70,21 +71,26 @@ def bhsd_to_cache_shape(cache):
     c = cache.permute(2, 0, 1, 3).reshape(s, b*h, d)
     return c
 
-def select_topk(v, indices):
+def select_topk(v:torch.Tensor, indices:torch.Tensor):
     """
     v cache, (b, kvhead, s, d)
     indices: (b, qhead, 1, k)
     """
     assert len(v.shape) == 4
-    b, n_qhead, tgt_s, k = indices
+    b, n_qhead, tgt_s, k = indices.shape
     n_kvhead = v.shape[1]
     group_size = n_qhead // n_kvhead    
 
+    print(f" >>> k: {k}")
     indices = indices.view(b, n_kvhead, group_size, tgt_s, k)
+
+    select_shape = (b, n_qhead, k)
     
-    idx_b = torch.arange(b).view(-1,1,1).expand(b, n_qhead, k)
-    idx_h = torch.arange(n_kvhead).repeat_interleave(group_size).view(1, -1, 1).expand(b, n_qhead, k)
-    idx_k = indices.flatten()
+    idx_b = torch.arange(b).view(-1,1,1).expand(*select_shape)
+    idx_h = torch.arange(n_kvhead).repeat_interleave(group_size).view(1, -1, 1).expand(*select_shape)
+    idx_k = indices.flatten().view(*select_shape)
+    # assert idx_b.shape == idx_k.shape and idx_h.shape == idx_k.shape, \
+    #     f" >>>>>> idx_b: {idx_b.shape}, idx_h: {idx_h.shape}, idx_k:{idx_k.shape}"
 
     return v[idx_b, idx_h, idx_k]
     
@@ -674,7 +680,9 @@ class TorchDevice:
 
         else:
             attn_value = self._sparse_gqa_value(q_pos, k1_pos, v1, 
-                                                k_cache, v_cache, attention_mask,
+                                                k_cache, v_cache,
+                                                attention_mask,
+                                                attn_sparsity,
                                                 layerno)
             
         dump_hidden(attn_value, "sdpa", layerno=layerno)
@@ -830,19 +838,20 @@ class TorchDevice:
         attn_weights = F.softmax(attn_weights, dim=2)
         return attn_weights
 
-    def _gqa_attention_weights(self, q:torch.Tensor, k:torch.Tensor, mask, b, src_s, n_qhead, n_kvhead):
+    def _gqa_attention_weights(self, q:torch.Tensor, k:torch.Tensor, mask:TorchTensor, b, src_s, n_qhead, n_kvhead):
         """
         q,k in shape (b, n_qhead, src_s, h)  
         ret: (b, nqhead, 1, src_s)
         """
+        b, n_qhead, tgt_s, head_dim = q.shape
         k1 = k.repeat_interleave(n_qhead//n_kvhead, dim=1)
-        mask = mask.view(b, 1, 1, src_s)
+        mask = mask.data.view(b, 1, 1, src_s)
         
         # -> (b*nqhead, src_s)
-        attn_weights = torch.bmm(
-            q.view(b*n_qhead, 1, -1),
-            k1.view(b*n_qhead, src_s, -1).T
-        )
+        q =  q.view(b*n_qhead, 1, head_dim)
+        k = k1.view(b*n_qhead, src_s, head_dim).transpose(-2, -1)
+
+        attn_weights = torch.bmm(q, k)
         attn_weights = attn_weights.view(b, n_qhead, 1, -1)
         attn_weights = attn_weights.where(mask, -1e4)
         attn_weights = F.softmax(attn_weights, dim=-1)
@@ -895,13 +904,14 @@ class TorchDevice:
         """
         q, k, v: (b, head, s, h)
         """
-        b, tgt_s, n_qhead, head_dim = q.shape
+        b, n_qhead, tgt_s, head_dim = q.shape
         src_s = mask.shape[-1]
         n_kvhead = k_new.shape[1]
         group_size = n_qhead // n_kvhead
 
         #get kcache
         k = extract_cache_to_bhsd(k_cache, b, n_kvhead, src_s, head_dim)
+        
         # attn-score    (b, qhead, 1, s)
         attn_weights = self._gqa_attention_weights(q, k, mask, b, src_s, n_qhead, n_kvhead)
         
@@ -911,26 +921,35 @@ class TorchDevice:
         topk_weights, topk_indices = attn_weights[:, :, :, :-1].topk(
             topk, dim=-1, sorted=False)
         # (b, head, 1, k) -> (b* ngroup, group_head* k)
-        topk_indices = topk_indices.view(b * n_kvhead, group_size * topk).T
+        # topk_indices = topk_indices.view(b * n_kvhead, group_size * topk).T
 
         # shape: (b, n_head, 1, topk+1)
         attn_weights = torch.cat([topk_weights,
             attn_weights[:, :, :, -1:]], dim=-1)
     
         # temporary on cuda, using only
+        
         v = extract_cache_to_bhsd(v_cache, b, n_kvhead, src_s, head_dim)
+        print(f" >>> shape of v: {v.shape}")
 
         # (b, head, k, d)
         v = select_topk(v, topk_indices)
+        print(f" >>> after select shape of v: {v.shape}")
 
         # (b, qhead, k+1, d)
         v_new = v_new.repeat_interleave(group_size, dim=1)
+        print(f" >>> in layer {layerno}")
+        # print(f" >>> shape of v: {v.shape}")
+        # print(f" >>> shape of v_new: {v_new.shape}")
+        print(f" >>> qhead: {n_qhead}")
+        print(f" >>> kvhead: {n_kvhead}")
         v = torch.concat([v, v_new], dim=2)
 
         attn_out = torch.bmm(
             attn_weights.view(b*n_qhead, tgt_s, topk+1),
             v.view(b*n_qhead, topk+1, head_dim)
         )
+        attn_out = attn_out.view(b, n_qhead, tgt_s, head_dim)
         
         return attn_out
 
@@ -1301,8 +1320,6 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
         # The normal path
         src = src.data[src_indices] if src_indices is not None else src.data
         dst = dst.data[dst_indices] if dst_indices is not None else dst.data
-        print(f" >>> src shape: {src.shape}")
-        print(f" >>> dst shape: {dst.shape}")
         dst.copy_(src, non_blocking=True)
 
 

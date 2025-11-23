@@ -20,7 +20,6 @@ import torch
 @dataclasses.dataclass(frozen=True)
 class QwenConfig :
     name="Qwen/Qwen2-0.5B"
-    vocab_size = 151936
     hidden_size = 896
     num_attention_heads = 14
     num_key_value_heads = 2
@@ -28,6 +27,7 @@ class QwenConfig :
     max_position_embeddings = 131072
     rms_norm_eps = 1e-6
     rope_theta = 1000000.0
+    vocab_size = 151936
     bos_token_id = 151643
     eos_token_id = 151643
     pad_token_id = 151643

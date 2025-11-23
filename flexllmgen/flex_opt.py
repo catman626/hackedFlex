@@ -1189,7 +1189,7 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
                           max_length=prompt_len).input_ids
     return (input_ids[0],) * num_prompts
 
-def get_file_inputs(fname):
+def get_file_inputs(fname, num_prompts, tokenizer):
     if fname.endswith(".txt"):
         prompt = open(fname).read()
         prompts = [ prompt ]
@@ -1198,8 +1198,9 @@ def get_file_inputs(fname):
         prompts = json.load(open(fname))
         prompts = [ p["prompt"] for p in prompts ]  
 
-    return prompts
+    input_ids = tokenizer(prompts, padding="longest").input_ids
 
+    return (input_ids[0], ) *num_prompts
     
    
 def run_flexllmgen(args):
