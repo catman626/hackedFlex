@@ -555,23 +555,25 @@ class TorchDevice:
 
         return TorchTensor.create_from_torch(value, self), k, v
 
-    def _gqa_value(self, q_pos, k1_pos, v1, k_cache, v_cache, attention_mask, src_s, b, n_kvhead, head_dim, layerno):
+    def _gqa_value(self, 
+                   q, k_new, v_new, 
+                   k_cache, v_cache, 
+                   attention_mask, 
+                   src_s, b, n_kvhead, head_dim, layerno):
         k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
         v = v_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
 
         dump_hidden(k, f"load-k", layerno, src_s-1)
-        # k = torch.concat([k, k1_pos], dim=2)
-        # v = torch.concat([v,v1], dim=2)
     
-        k[:, :, src_s-1:src_s, :] = k1_pos
-        v[:, :, src_s-1:src_s, :] = v1
+        k[:, :, src_s-1:src_s, :] = k_new
+        v[:, :, src_s-1:src_s, :] = v_new
 
         dump_hidden(k, "k", layerno)
         dump_hidden(v, "v", layerno)
 
         # mask: (B, S) -> (B, 1, 1, S)
         mask = attention_mask.data.view(b, 1, 1, -1)
-        value = F.scaled_dot_product_attention(q_pos, k, v, attn_mask=mask, enable_gqa=True)
+        value = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
         return value
 
     def gqa_gen(self, inputs, attention_mask, position_embed, w_q, b_q, w_k, b_k, w_v, b_v,
@@ -624,8 +626,6 @@ class TorchDevice:
             # warning, position src_s-1 is for new kv
             # k = k_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
             # v = v_cache.data[:src_s-1].view(src_s-1, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
-            
-            
             value = self._gqa_value(q_pos, k1_pos, v1, 
                                     k_cache, v_cache, 
                                     attention_mask, 
