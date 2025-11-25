@@ -419,7 +419,7 @@ class TorchDevice:
             )
             shape = (prompt_len + gen_len-1, gpu_batch_size *n_head, hidden_size//n_head)
 
-        elif config.name.startswith("Qwen"):
+        elif config.name.startswith("qwen"):
             n_qhead, n_kvhead, hidden_size, prompt_len, gen_len, gpu_batch_size = (
                 config.num_attention_heads, config.num_key_value_heads, config.hidden_size, task.prompt_len, task.gen_len,
                 policy.gpu_batch_size)

@@ -1189,7 +1189,8 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
                           max_length=prompt_len).input_ids
     return (input_ids[0],) * num_prompts
 
-def get_file_inputs(fname, num_prompts, tokenizer):
+def get_file_inputs(fname, num_prompts, tokenizer, prompt_len=None):
+    ''' prompt_len set: cut first n tokens'''
     if fname.endswith(".txt"):
         prompt = open(fname).read()
         prompts = [ prompt ]

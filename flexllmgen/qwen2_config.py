@@ -25,9 +25,9 @@ class QwenConfig :
     intermediate_size :int = 4864
     max_position_embeddings :int = 131072
     num_hidden_layers :int = 24
+    vocab_size :int = 151936
     rms_norm_eps = 1e-6
     rope_theta = 1000000.0
-    vocab_size = 151936
     bos_token_id = 151643
     eos_token_id = 151643
     pad_token_id = 151643
@@ -61,12 +61,13 @@ def get_qwen_config(name):
         name = name.split("/")[-1]
     name = name.lower()
 
-    if name == "qwen2-0.5b":
-        return QwenConfig()
+    if name == "qwen2-0.5b" or name == "qwen2-0.5b-instruct":
+        return QwenConfig(name=name)
     elif name == "qwen2-7b":
         config = QwenConfig(
             name=name, hidden_size=3584, intermediate_size=18944,
-            num_attention_heads = 14, num_hidden_layers = 24, num_key_value_heads = 2
+            num_attention_heads = 14, num_hidden_layers = 24, num_key_value_heads = 2,
+            vocab_size=152064
         )
         return config
     else:
@@ -110,8 +111,9 @@ def disable_hf_opt_init():
 
 
 model_to_cache = {
-    "Qwen/Qwen2-0.5B": "/home/llmserver/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B/snapshots/91d2aff3f957f99e4c74c962f2f408dcc88a18d8",
-    "Qwen/Qwen2-7B": "/home/llmserver/.cache/huggingface/hub/models--Qwen--Qwen2-7B/snapshots/453ed1575b739b5b03ce3758b23befdb0967f40e"
+    "qwen2-0.5b": "/home/llmserver/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B/snapshots/91d2aff3f957f99e4c74c962f2f408dcc88a18d8",
+    "qwen2-7b": "/home/llmserver/.cache/huggingface/hub/models--Qwen--Qwen2-7B/snapshots/453ed1575b739b5b03ce3758b23befdb0967f40e",
+    "qwen2-0.5b-instruct": "/home/llmserver/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B-Instruct/snapshots/c540970f9e29518b1d8f06ab8b24cba66ad77b6d"
 }
 def convert_qwen_weights(model_name, path):
     

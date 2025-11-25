@@ -1335,7 +1335,7 @@ def run_flexllmgen(args):
 
     # Task and policy
     if args.input_file is not None:  
-        input_in_tokens = get_file_inputs(args.input_file, num_prompts, tokenizer)
+        input_in_tokens = get_file_inputs(args.input_file, num_prompts, tokenizer, args.prompt_len)
         # input_in_tokens = tokenizer(inputs, padding="longest").input_ids
     else:
         input_in_tokens = get_compact_test_inputs(num_prompts, tokenizer)
@@ -1428,6 +1428,7 @@ def run_flexllmgen(args):
         print(log_str)
 
 def add_parser_arguments(parser):
+    #arg
     parser.add_argument("--model", type=str, default="Qwen/Qwen2-0.5B",
         help="The model name.")
     parser.add_argument("--path", type=str, default="~/qwen_weights",
@@ -1439,6 +1440,8 @@ def add_parser_arguments(parser):
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")
+    parser.add_argument("--prompt-len", type=int, 
+                        help="combined with input-file, get the front tokens")
     parser.add_argument("--debug-mode", type=str,
         choices=["fewer_batch", "breakdown", "output_hidden", "basic"])
     parser.add_argument("--gpu-batch-size", type=int, default=4)
