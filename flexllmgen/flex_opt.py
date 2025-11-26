@@ -1181,6 +1181,8 @@ def get_compact_test_inputs(num_prompts, tokenizer):
     input_ids = tokenizer(prompts, padding="longest").input_ids
 
     return (input_ids[0], ) * num_prompts
+
+
     
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):

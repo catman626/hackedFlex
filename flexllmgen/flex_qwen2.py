@@ -313,9 +313,6 @@ class SelfAttention:
             indices = (slice(pos - k_new.shape[0], pos),
                        slice(0, k_new.shape[1]))
 
-        # print(f" >>> indices: {indices}")
-        # print(f" >>> store-cache at decoding step {i}")
-        # print(f" >>> store cache indices: {indices}")
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
 
@@ -525,12 +522,9 @@ class TransformerLayer:
         else:
             read_buf1, read_buf2 = weight_read_buf.val
 
-        print(f" >>> pre layer-{i} attention")
         self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask, position_embedding, 
                                cache_write_buf, i, k)
-        print(f" >>> post layer-{i} attention")
         self.mlp.forward(hidden, None, read_buf2, attention_mask, position_embedding, None,  i, k)
-        print(f" >>> post layer-{i} mlp")
 
 class InputEmbed:
     def __init__(self, config, env, policy):
@@ -589,11 +583,9 @@ class InputEmbed:
         else:
             (w_token, _),  = weight_read_buf.val
 
-        # print(f" >>> hidden in dtype: {h.data.dtype}")
         h = self.compute.qwen_input_embed(h, w_token, self.config.pad_token_id, donate)
         hidden.val = h
 
-        # dump_hidden(h.data, "output_embed" )
 
 class OutputEmbed:
     def __init__(self, config, env, policy):
@@ -732,7 +724,6 @@ class QwenLM:
             os.path.join(self.path, f"{self.config.name}-np")))
         check_path = os.path.join(expanded_path, "embed_tokens.weight")
 
-        # print(f" >>> checking path: {check_path}")
         if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
             convert_qwen_weights(self.config.name, self.path)
 
@@ -966,7 +957,7 @@ class QwenLM:
         self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
             self.config.pad_token_id, dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
-        print(f" >>> shape of output_ids: {self.output_ids.shape}")
+        print(f" >>> shape of input: {self.output_ids.shape}")
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
         assert gpu_batch_size * num_gpu_batches == len(task.inputs)
 
@@ -1337,6 +1328,10 @@ def run_flexllmgen(args):
     if args.input_file is not None:  
         input_in_tokens = get_file_inputs(args.input_file, num_prompts, tokenizer, args.prompt_len)
         # input_in_tokens = tokenizer(inputs, padding="longest").input_ids
+        # TODO
+        # prompt-len settings not set
+    elif args.prompt_len is not None:
+        input_in_tokens = get_test_inputs(args.prompt_len, num_prompts, tokenizer)
     else:
         input_in_tokens = get_compact_test_inputs(num_prompts, tokenizer)
 
@@ -1428,7 +1423,7 @@ def run_flexllmgen(args):
         print(log_str)
 
 def add_parser_arguments(parser):
-    #arg
+    #args
     parser.add_argument("--model", type=str, default="Qwen/Qwen2-0.5B",
         help="The model name.")
     parser.add_argument("--path", type=str, default="~/qwen_weights",
@@ -1436,12 +1431,11 @@ def add_parser_arguments(parser):
              "FlexLLMGen will automatically download them from HuggingFace.")
     parser.add_argument("--offload-dir", type=str, default="flexllmgen_offload_dir",
         help="The directory to offload tensors. ")
-    # parser.add_argument("--prompt-len", type=int, default=512)
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")
     parser.add_argument("--prompt-len", type=int, 
-                        help="combined with input-file, get the front tokens")
+            help="combined with input-file, get the front tokens, default: None, use the longest-padding of tokenizer")
     parser.add_argument("--debug-mode", type=str,
         choices=["fewer_batch", "breakdown", "output_hidden", "basic"])
     parser.add_argument("--gpu-batch-size", type=int, default=4)

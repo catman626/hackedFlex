@@ -25,6 +25,7 @@ DUMP_HIDDEN = False
 # DUMP_HIDDEN = True
 DUMP_VERBOSE = False
 
+
 def dump_hidden(torch_obj, name, layerno=None, seq_len=None):
     global DUMP_HIDDEN, DUMP_VERBOSE
     if DUMP_HIDDEN == False:
@@ -94,6 +95,20 @@ def select_topk(v:torch.Tensor, indices:torch.Tensor):
     #     f" >>>>>> idx_b: {idx_b.shape}, idx_h: {idx_h.shape}, idx_k:{idx_k.shape}"
 
     return v[idx_b, idx_h, idx_k]
+
+def expand_block_idx(block_idx, block_size):
+    # block_idx : (*, topk)
+    prefix_shape = block_idx.shape[:-1]
+    topk = block_idx.shape[-1]
+
+    block_starts = block_idx * block_size
+    intra_block_idx = torch.arange(block_size)
+
+    expanded = block_starts.unsqueeze(-1) + intra_block_idx
+    expanded = expaned.flatten(-2)
+
+    return expaned
+    
 
 #def evaluate(q, k):
     #""" both in BHND """
@@ -848,14 +863,18 @@ class TorchDevice:
         attn_weights = F.softmax(attn_weights, dim=2)
         return attn_weights
 
-    def _gqa_attention_weights(self, q:torch.Tensor, k:torch.Tensor, mask:TorchTensor, b, src_s, n_qhead, n_kvhead):
+    def _gqa_attn_weights(self, q:torch.Tensor, k:torch.Tensor, mask:TorchTensor):
         """
         q,k in shape (b, n_qhead, src_s, h)  
         ret: (b, nqhead, 1, src_s)
         """
         b, n_qhead, tgt_s, head_dim = q.shape
+        _, n_kvhead, src_s, _ = k.shape[2]
+        
         k1 = k.repeat_interleave(n_qhead//n_kvhead, dim=1)
-        mask = mask.data.view(b, 1, 1, src_s)
+        
+        if mask is not None:
+            mask = mask.data.view(b, 1, 1, src_s)
         
         # -> (b*nqhead, src_s)
         q =  q.view(b*n_qhead, 1, head_dim)
@@ -863,7 +882,10 @@ class TorchDevice:
 
         attn_weights = torch.bmm(q, k)
         attn_weights = attn_weights.view(b, n_qhead, 1, -1)
-        attn_weights = attn_weights.where(mask, -1e4)
+
+        if mask is not None:
+            attn_weights = attn_weights.where(mask, -1e4)
+
         attn_weights = F.softmax(attn_weights, dim=-1)
         return attn_weights
 
@@ -910,19 +932,16 @@ class TorchDevice:
 
     def _naive_sparse_gqa_value(self, q, k_new, v_new, 
                                       k_cache, v_cache, mask, attn_sparsity, layerno):
-        b, n_qhead, tgt_s, head_dim = q.shape
-        src_s = mask.shape[-1]
-        n_kvhead = k_new.shape[1]
-        group_size = n_qhead // n_kvhead
 
+        group_size = n_qhead // n_kvhead
         #get kcache
         k = extract_cache_to_bhsd(k_cache, b, n_kvhead, src_s, head_dim)
         
         # attn-score    (b, qhead, 1, s)
-        attn_weights = self._gqa_attention_weights(q, k, mask, b, src_s, n_qhead, n_kvhead)
+        attn_weights = self._gqa_attn_weights(q, k, mask, b, src_s, n_qhead, n_kvhead)
         
         # shape: (b, n_head, 1, s)
-        # attn_weights = self._gqa_attention_weights(q, k_new, mask, b, src_s, n_qhead, n_kvhead)
+        # attn_weights = self._gqa_attn_weights(q, k_new, mask, b, src_s, n_qhead, n_kvhead)
         topk = int(attn_sparsity * (src_s - 1))
         topk_weights, topk_indices = attn_weights[:, :, :, :-1].topk(
             topk, dim=-1, sorted=False)
@@ -959,23 +978,45 @@ class TorchDevice:
         
         return attn_out
 
-    def _block_sparse_gqa_value(self, q, k_new, v_new, k_cache, v_cache, k_summary, mask, attn_sparsity, layerno):
+    def _block_sparse_gqa_value(self, q, k_new, v_new, k_cache, v_cache, k_summary, mask, attn_sparsity, layerno, sparse_config):
         # get summary in some way
         #   from parameters?
-        pass
+
+        block_weights = _gqa_attn_weights(q, k_cache, mask=None)
+
+        # selected tokens (idx) in shape (b, qhead, tgt_s, topk)
+        selected_tokens = expand_block_idx(block_weights, sparse_config.block_size)
         
+        # emit load task
+        selected_k alloc (b, qhead, tgt_s, topk)
+        selected_v alloc (b, qhead, tgt_s, topk)
+        
+        selected_k = general_copy(selected_k, dst_indices=None, k_cache, selected_tokens)
+        selected_v = general_copy(selected_v, dst_indices=None, k_cache, selected_tokens)
+
+        F.scaled_dot_product_attention(q, selected_k, selected_v)
         
 
     def _sparse_gqa_value(self, q, k_new, v_new, 
                           k_cache, v_cache, 
                           mask, 
-                          attn_sparsity, layerno):
+                          sparse_config, layerno, k_summary=None):
         """
         q, k, v: (b, head, s, h)
         """
+        b, n_qhead, tgt_s, head_dim = q.shape
+        src_s = mask.shape[-1]
+        n_kvhead = k_new.shape[1]
 
-        return _naive_sparse_gqa_value(w, v_new, 
-                k_cache, v_cache, mask, attn_sparsity, layerno)
+        if sparse_config.mode == "naive":
+            return _naive_sparse_gqa_value(w, v_new, 
+                k_cache, v_cache, mask, sparse_config.attn_sparsity, layerno, b, n_qhead, n_kvhead, src_s, tgt_s, head_dim)
+        elif sparse_config.mode == "block":
+            assert k_summary is not None
+
+            
+
+
 
         
 
@@ -1344,8 +1385,13 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
         dst.copy_(src, non_blocking=True)
     else:
         # The normal path
-        src = src.data[src_indices] if src_indices is not None else src.data
+        if isinstance(src_indices, tuple):
+            src = src.data[*src_indices]
+        else:
+            src = src.data[src_indices] if src_indices is not None else src.data
+
         dst = dst.data[dst_indices] if dst_indices is not None else dst.data
+
         dst.copy_(src, non_blocking=True)
 
 
