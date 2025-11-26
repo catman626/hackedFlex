@@ -333,26 +333,16 @@ class SelfAttention:
         h, donate[0] = hidden.val, True
 
         if k == self.policy.num_gpu_batches - 1:
-            # Clear the weight_read_buf if it is the last gpu batch
-            # ((w_q, donate[2]), (b_q, donate[3]), (w_k, donate[4]), (b_k, donate[5]),
-            #  (w_v, donate[6]), (b_v, donate[7]), (w_out, donate[8]), (b_out, donate[9]),
-            #  (w_ln, donate[10]), (b_ln, donate[11])) = weight_read_buf.pop()
             ((w_q, donate[3]), (b_q, donate[4]), (w_k, donate[5]), (b_k, donate[6]),
              (w_v, donate[7]), (b_v, donate[8]), (w_out, donate[9]),
              (w_ln, donate[10])) = weight_read_buf.pop()
         else:
-            # ((w_q, _), (b_q, _), (w_k, _), (b_k, _),
-            #  (w_v, _), (b_v, _), (w_out, _), (b_out, _),
-            #  (w_ln, _), (b_ln, _)) = weight_read_buf.val
             ((w_q, _), (b_q, _), (w_k, _), (b_k, _),
              (w_v, _), (b_v, _), (w_out, _), 
              (w_ln, _)) = weight_read_buf.val
 
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            # cos, sin = position_embeddings.val
-            # cos, donate_cos = cos.smart_copy(self.compute)
-            # sin, donate_sin = sin.smart_copy(self.compute)
             position_embed, donate[2] = position_embeddings.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.gqa(h, mask, position_embed, w_q, b_q,
                 w_k, b_k, w_v, b_v, w_out, w_ln, (n_qhead, n_kvhead), donate,

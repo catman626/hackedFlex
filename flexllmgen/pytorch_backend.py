@@ -988,8 +988,9 @@ class TorchDevice:
         selected_tokens = expand_block_idx(block_weights, sparse_config.block_size)
         
         # emit load task
-        selected_k alloc (b, qhead, tgt_s, topk)
-        selected_v alloc (b, qhead, tgt_s, topk)
+        seleceted_kv_shape = (b, qhead, tgt_s, topk)
+        selected_k = self.allocate(selected_shape, dtype=k_new.dtype)
+        selected_v = self.allocate(selected_shape, dtype=k_new.dtype)
         
         selected_k = general_copy(selected_k, dst_indices=None, k_cache, selected_tokens)
         selected_v = general_copy(selected_v, dst_indices=None, k_cache, selected_tokens)
