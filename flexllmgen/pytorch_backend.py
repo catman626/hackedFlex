@@ -24,6 +24,7 @@ global_disk_device = None
 DUMP_HIDDEN = False
 # DUMP_HIDDEN = True
 DUMP_VERBOSE = False
+
 def dump_hidden(torch_obj, name, layerno=None, seq_len=None):
     global DUMP_HIDDEN, DUMP_VERBOSE
     if DUMP_HIDDEN == False:
@@ -93,6 +94,14 @@ def select_topk(v:torch.Tensor, indices:torch.Tensor):
     #     f" >>>>>> idx_b: {idx_b.shape}, idx_h: {idx_h.shape}, idx_k:{idx_k.shape}"
 
     return v[idx_b, idx_h, idx_k]
+
+#def evaluate(q, k):
+    #""" both in BHND """
+    #b, qhead, s_q, hidden = q.shape
+    #kvhead = k.shape
+    #
+    #k = k.interleave(qhead // kvhead, dim=1)
+    
     
 class DeviceType(Enum):
     CPU = auto()
@@ -489,6 +498,7 @@ class TorchDevice:
 
         # attention-core
         attn_output = F.scaled_dot_product_attention(q_pos, k_pos, v, attn_mask=mask, enable_gqa=True)
+        # attn_output = fi.
 
         dump_hidden(attn_output, "sdpa", layerno)   # in shape (b, head, s, h)
         
@@ -897,13 +907,9 @@ class TorchDevice:
         # shape: (b * n_head, 1, head_dim)
         return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
 
-    def _sparse_gqa_value(self, q, k_new, v_new, 
-                          k_cache, v_cache, 
-                          mask, 
-                          attn_sparsity, layerno):
-        """
-        q, k, v: (b, head, s, h)
-        """
+
+    def _naive_sparse_gqa_value(self, q, k_new, v_new, 
+                                      k_cache, v_cache, mask, attn_sparsity, layerno):
         b, n_qhead, tgt_s, head_dim = q.shape
         src_s = mask.shape[-1]
         n_kvhead = k_new.shape[1]
@@ -952,6 +958,26 @@ class TorchDevice:
         attn_out = attn_out.view(b, n_qhead, tgt_s, head_dim)
         
         return attn_out
+
+    def _block_sparse_gqa_value(self, q, k_new, v_new, k_cache, v_cache, k_summary, mask, attn_sparsity, layerno):
+        # get summary in some way
+        #   from parameters?
+        pass
+        
+        
+
+    def _sparse_gqa_value(self, q, k_new, v_new, 
+                          k_cache, v_cache, 
+                          mask, 
+                          attn_sparsity, layerno):
+        """
+        q, k, v: (b, head, s, h)
+        """
+
+        return _naive_sparse_gqa_value(w, v_new, 
+                k_cache, v_cache, mask, attn_sparsity, layerno)
+
+        
 
     def _mixed_device_attention(self, q, k_cache, v_cache, k_new, v_new,
             mask, b, src_s, tgt_s, n_head, head_dim):

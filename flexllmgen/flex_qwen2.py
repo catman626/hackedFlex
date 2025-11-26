@@ -732,7 +732,7 @@ class QwenLM:
             os.path.join(self.path, f"{self.config.name}-np")))
         check_path = os.path.join(expanded_path, "embed_tokens.weight")
 
-        print(f" >>> checking path: {check_path}")
+        # print(f" >>> checking path: {check_path}")
         if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
             convert_qwen_weights(self.config.name, self.path)
 
