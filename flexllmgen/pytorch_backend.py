@@ -91,7 +91,6 @@ def select_topk(v:torch.Tensor, indices:torch.Tensor):
     n_kvhead = v.shape[1]
     group_size = n_qhead // n_kvhead    
 
-    print(f" >>> k: {k}")
     indices = indices.view(b, n_kvhead, group_size, tgt_s, k)
 
     select_shape = (b, n_qhead, k)

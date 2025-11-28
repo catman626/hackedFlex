@@ -12,8 +12,18 @@ import os
 import numpy as np
 from tqdm import tqdm
 
-from safetensors.torch import load_file, load, save_file
+import torch
 
+
+def element_size_of(element_dtype):
+    element_size_dict = {
+        torch.float: 4,
+        torch.float16: 2,
+        torch.bfloat16: 2,
+        np.float32: 4,
+        np.float16: 2
+    }
+    return element_size_dict[element_dtype]
 
 @dataclasses.dataclass(frozen=True)
 class QwenConfig :
@@ -44,16 +54,21 @@ class QwenConfig :
         # 每层MLP参数（SwiGLU双投影+输出投影+RMSNorm）
         mlp = h * (self.intermediate_size * 2) + self.intermediate_size * h + h
         
-        return (embed + n_layers * (attn + mlp)) * 2  # ×2对应float16字节数
+        return (embed + n_layers * (attn + mlp)) * element_size_of(self.dtype)  # ×2对应float16字节数
 
     def cache_bytes(self, batch_size: int, seq_len: int) -> int:
         head_dim = self.hidden_size // self.num_attention_heads
         # 每组KV缓存（K+V各一份）× 层数 × 字节数
-        return batch_size * self.num_key_value_heads * seq_len * head_dim * 2 * self.num_hidden_layers * 2
+        element_size = np.dtype(self.dtype).itemsize
+        return batch_size * \
+                self.num_key_value_heads * seq_len * head_dim * 2 \
+                * self.num_hidden_layers \
+                * element_size_of(self.dtype) 
 
     def hidden_bytes(self, batch_size: int, seq_len: int) -> int:
         # 隐藏状态张量（batch×seq×hidden）× 字节数
-        return batch_size * seq_len * self.hidden_size * 2
+        element_size = np.dtype(self.dtype).itemsize
+        return batch_size * seq_len * self.hidden_size * element_size_of(self.dtype)
 
 
 def get_qwen_config(name):
@@ -127,6 +142,7 @@ def convert_qwen_weights(model_name, path):
     os.makedirs(seperated_weight_dir, exist_ok=True)
 
     import torch
+    from safetensors.torch import load_file, load, save_file
 
     print(f" >>> seperated weight dir: {seperated_weight_dir}")
     for safetensor_file in tqdm(safetensor_files, desc="Convert format"):

@@ -22,7 +22,6 @@ def get_prompts(prompt_file):
 
 def main(args):
     # Prompts
-    
     prompts = [
         "Question: Where were the 2004 Olympics held?\n"
         "Answer: Athens, Greece\n"

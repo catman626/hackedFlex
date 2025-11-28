@@ -1313,8 +1313,10 @@ def basic_test(args):
     print(outputs)
 
 def predict_mem_and_log(qwen_config, num_prompts, prompt_len, gen_len):
-    cache_size = qwen_config.cache_bytes(num_prompts, prompt_len + gen_len)
-    hidden_size = qwen_config.hidden_bytes(num_prompts, prompt_len + gen_len)
+    context_len = prompt_len + gen_len 
+    cache_size = qwen_config.cache_bytes(num_prompts, context_len)
+    hidden_size = qwen_config.hidden_bytes(num_prompts, context_len)
+    print(f" >>> genlen: {context_len}, ")
     print(f"model size: {qwen_config.model_bytes()/GB:.3f} GB, "
     f"cache size: {cache_size/GB:.3f} GB, "
     f"hidden size (prefill): {hidden_size/GB:.3f} GB")
@@ -1336,9 +1338,6 @@ def run_flexllmgen(args):
     # Task and policy
     if args.input_file is not None:  
         input_in_tokens = get_file_inputs(args.input_file, num_prompts, tokenizer, args.prompt_len)
-        # input_in_tokens = tokenizer(inputs, padding="longest").input_ids
-        # TODO
-        # prompt-len settings not set
     elif args.prompt_len is not None:
         input_in_tokens = get_test_inputs(args.prompt_len, num_prompts, tokenizer)
     else:
@@ -1429,8 +1428,10 @@ def add_parser_arguments(parser):
             help="combined with input-file, get the front tokens, default: None, use the longest-padding of tokenizer")
     parser.add_argument("--debug-mode", type=str,
         choices=["fewer_batch", "breakdown", "output_hidden", "basic"])
+
     parser.add_argument("--gpu-batch-size", type=int, default=4)
     parser.add_argument("--num-gpu-batches", type=int, default=1)
+
     parser.add_argument("--percent", nargs="+", type=int,
         default=[100, 0, 100, 0, 100, 0],
         help="Six numbers. They are "
