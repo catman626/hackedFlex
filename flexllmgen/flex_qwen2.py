@@ -19,6 +19,7 @@ from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     read_benchmark_log)
 from flexllmgen.qwen2_config import QwenConfig, get_qwen_config, convert_qwen_weights
 from flexllmgen.compression import CompressionConfig
+from flexllmgen.sparse import SparseConfig
 
 
 from flexllmgen.flex_opt import init_weight_list, get_compact_test_inputs, get_file_inputs, get_test_inputs, get_filename
@@ -51,7 +52,7 @@ class Policy:
     cpu_cache_compute: bool
 
     # Sparsity of attention weights
-    attn_sparsity: float
+    sparse_config: SparseConfig
 
     # Compress weights with group-wise quantization
     compress_weight: bool
@@ -255,7 +256,7 @@ class SelfAttention:
             indices = (slice(0, self.task.prompt_len + i),
                        slice(0, k_home.shape[1]))
 
-            if self.policy.attn_sparsity >= 1.0:
+            if self.policy.sparse_config.mode == "dense":
                 cache_read_buf.store((
                     k_home.smart_copy(dst, indices),
                     v_home.smart_copy(dst, indices),
@@ -272,7 +273,7 @@ class SelfAttention:
                        slice(0, k_home.shape[1]))
             general_copy(k_buf, indices, k_home, indices)
 
-            if self.policy.attn_sparsity >= 1.0:
+            if self.policy.sparse_config.mode == "dense" :
                 general_copy(v_buf, indices, v_home, indices)
                 cache_read_buf.store(((k_buf, False), (v_buf, False)))
             else:
@@ -292,7 +293,7 @@ class SelfAttention:
             general_copy(v_buf, indices, v_home, indices)
             cache_read_buf.store((((gpu_k_buf, k_buf,), False),
                                   ((gpu_v_buf, v_buf,), False)))
-            assert self.policy.attn_sparsity >= 1.0
+            assert self.policy.sparse_config.mode == "dense"
         else:
             raise ValueError(f"Invalid path: {path}")
 
@@ -363,7 +364,7 @@ class SelfAttention:
                 k_cache, 
                 v_cache, 
                 donate, 
-                self.policy.attn_sparsity,
+                self.policy.sparse_config,
                 self.policy.compress_cache, 
                 self.policy.comp_cache_config,
                 self.layer_id)
@@ -1266,27 +1267,38 @@ def get_env():
     return env
 
 
-def get_policy(args):
+def build_policy(args):
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
                     args.percent[0], args.percent[1],
                     args.percent[2], args.percent[3],
                     args.percent[4], args.percent[5],
                     args.overlap, args.sep_layer, args.pin_weight,
-                    args.cpu_cache_compute, args.attn_sparsity,
+                    args.cpu_cache_compute, 
+                    SparseConfig(mode=args.sparse_mode, block_size=args.sparse_block_size),
                     args.compress_weight,
                     CompressionConfig(num_bits=4, group_size=64,
                                       group_dim=0, symmetric=False),
                     args.compress_cache,
                     CompressionConfig(num_bits=4, group_size=64,
                                       group_dim=2, symmetric=False))
-    
+    assert not (args.compress_cache and args.sparse_config.mode != "dense" ), "Not implemented"
     return policy
+
+
+def build_env(args):
+    gpu = TorchDevice("cuda:0")
+    cpu = TorchDevice("cpu")
+    disk = TorchDisk(args.offload_dir)
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+
+    return env
+
     
 def basic_test(args):
     input_ids = [[100, 200, 300, ]]
     # input_ids = [[100, 200, 300, 279, 1156]]
 
-    policy = get_policy(args)
+    policy = build_policy(args)
     config = get_qwen_config(args.model)
 
     env = get_env()
@@ -1300,13 +1312,20 @@ def basic_test(args):
 
     print(outputs)
 
+def predict_mem_and_log(qwen_config, num_prompts, prompt_len, gen_len):
+    cache_size = qwen_config.cache_bytes(num_prompts, prompt_len + gen_len)
+    hidden_size = qwen_config.hidden_bytes(num_prompts, prompt_len + gen_len)
+    print(f"model size: {qwen_config.model_bytes()/GB:.3f} GB, "
+    f"cache size: {cache_size/GB:.3f} GB, "
+    f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+
+    return hidden_size, cache_size
+
+
 
 def run_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
-    if args.model == "facebook/galactica-30b":
-        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
         # print(f" >>> tokenizer use model: {args.model}")
         
     # prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
@@ -1327,40 +1346,22 @@ def run_flexllmgen(args):
 
     # in shape (B, S)
     warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
-
-    gpu = TorchDevice("cuda:0")
-    cpu = TorchDevice("cpu")
-    disk = TorchDisk(args.offload_dir)
-    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
-
-    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
-                    args.percent[0], args.percent[1],
-                    args.percent[2], args.percent[3],
-                    args.percent[4], args.percent[5],
-                    args.overlap, args.sep_layer, args.pin_weight,
-                    args.cpu_cache_compute, args.attn_sparsity,
-                    args.compress_weight,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=0, symmetric=False),
-                    args.compress_cache,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
-    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
+    wramup_prompt_len = len(warmup_inputs[0])
+    prompt_len = len(input_in_tokens[0])
     
-    prompt_len = len(warmup_inputs[0])
+    # policy, env preparations
+    policy = build_policy(args)    
+    env = build_env(args)
+    
     qwen_config = get_qwen_config(args.model)
-    cache_size = qwen_config.cache_bytes(num_prompts, prompt_len + gen_len)
-    hidden_size = qwen_config.hidden_bytes(num_prompts, prompt_len + gen_len)
-    print(f"model size: {qwen_config.model_bytes()/GB:.3f} GB, "
-          f"cache size: {cache_size/GB:.3f} GB, "
-          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+
+    hidden_size, cache_size  = predict_mem_and_log(qwen_config, num_prompts, prompt_len, gen_len)
 
     print("init weight...")
     model = QwenLM(qwen_config, env, args.path, policy)
 
     try:
         print("warmup - generate")
-        print(f" >>> warmup inputs in type: {type(warmup_inputs)}")
         output_ids = model.generate(
             warmup_inputs, max_new_tokens=1, verbose=args.verbose
         )
@@ -1384,8 +1385,8 @@ def run_flexllmgen(args):
     num_generated_tokens = num_prompts * gen_len
     total_latency = prefill_latency + decode_latency
     total_throughput = num_generated_tokens / total_latency
-    _, gpu_peak_mem = gpu.mem_stats()
-    _, cpu_peak_mem = cpu.mem_stats()
+    _, gpu_peak_mem = env.gpu.mem_stats()
+    _, cpu_peak_mem = env.cpu.mem_stats()
 
     if DUMMY_WEIGHT not in args.path:
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
@@ -1396,8 +1397,8 @@ def run_flexllmgen(args):
         if args.verbose >= 2:
             print(show_str)
 
-    gpu.print_stats()
-    cpu.print_stats()
+    env.gpu.print_stats()
+    env.cpu.print_stats()
     projected = bool(args.debug_mode or cut_gen_len)
 
     if args.log_file == "auto":
@@ -1443,8 +1444,12 @@ def add_parser_arguments(parser):
         const=True, default=True)
     parser.add_argument("--pin-weight", type=str2bool, nargs="?",
         const=True, default=True)
+
     parser.add_argument("--cpu-cache-compute", action="store_true")
+    parser.add_argument("--sparse-mode", type=str, default="dense")
     parser.add_argument("--attn-sparsity", type=float, default=1.0)
+    parser.add_argument("--sparse-block-size", type=int, default=64)
+    
     parser.add_argument("--compress-weight", action="store_true",
         help="Whether to compress weight.")
     parser.add_argument("--compress-cache", action="store_true",

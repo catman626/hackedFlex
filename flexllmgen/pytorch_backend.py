@@ -25,6 +25,7 @@ DUMP_HIDDEN = False
 # DUMP_HIDDEN = True
 DUMP_VERBOSE = False
 
+sparse_block_summary: torch.Tensor
 
 def dump_hidden(torch_obj, name, layerno=None, seq_len=None):
     global DUMP_HIDDEN, DUMP_VERBOSE
@@ -54,6 +55,13 @@ def fix_recursive_import():
     from flexllmgen import compression
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
+
+def derive_shapes(q, k, mask):
+    b, n_qhead, tgt_s, head_dim = q.shape
+    src_s = mask.shape[-1]
+    n_kvhead = k.shape[1]
+
+    return b, n_qhead, n_kvhead, tgt_s, src_s, head_dim
 
 def cache_shape(config, task, policy):
     n_qhead, n_kvhead, hidden_size, prompt_len, gen_len, gpu_batch_size = (
@@ -650,7 +658,7 @@ class TorchDevice:
 
     def gqa_gen(self, inputs, attention_mask, position_embed, w_q, b_q, w_k, b_k, w_v, b_v,
                 w_out, w_ln, n_head:tuple[int, int], k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config, layerno=None):
+                sparse_config, compress_cache, comp_config, layerno=None):
         """Multi-head attention (decoding phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
@@ -692,7 +700,7 @@ class TorchDevice:
         dump_hidden(q_pos, "q_pos", layerno)
 
         # gqa-gen-sparse
-        if attn_sparsity >= 1.0:
+        if sparse_config.mode == "dense":
             # kv-cache
             # (src_s, b*head, h) -> (src_s, b, head, h) -> (b, head, src_s, h)
             # warning, position src_s-1 is for new kv
@@ -707,7 +715,7 @@ class TorchDevice:
             attn_value = self._sparse_gqa_value(q_pos, k1_pos, v1, 
                                                 k_cache, v_cache,
                                                 attention_mask,
-                                                attn_sparsity,
+                                                sparse_config,
                                                 layerno)
             
         dump_hidden(attn_value, "sdpa", layerno=layerno)
@@ -868,8 +876,9 @@ class TorchDevice:
         q,k in shape (b, n_qhead, src_s, h)  
         ret: (b, nqhead, 1, src_s)
         """
-        b, n_qhead, tgt_s, head_dim = q.shape
-        _, n_kvhead, src_s, _ = k.shape[2]
+        # b, n_qhead, tgt_s, head_dim = q.shape
+        # _, n_kvhead, src_s, _ = k.shape[2]
+        b, n_qhead, n_kvhead, tgt_s, src_s, head_dim = derive_shapes(q, k, mask)
         
         k1 = k.repeat_interleave(n_qhead//n_kvhead, dim=1)
         
@@ -931,18 +940,20 @@ class TorchDevice:
 
 
     def _naive_sparse_gqa_value(self, q, k_new, v_new, 
-                                      k_cache, v_cache, mask, attn_sparsity, layerno):
+                                      k_cache, v_cache, 
+                                      mask, sparsity_config, 
+                                      layerno):
+
+        b, n_qhead, n_kvhead, tgt_s, src_s, head_dim = derive_shapes(q, k_new, mask)
 
         group_size = n_qhead // n_kvhead
         #get kcache
         k = extract_cache_to_bhsd(k_cache, b, n_kvhead, src_s, head_dim)
         
         # attn-score    (b, qhead, 1, s)
-        attn_weights = self._gqa_attn_weights(q, k, mask, b, src_s, n_qhead, n_kvhead)
+        attn_weights = self._gqa_attn_weights(q, k, mask)
         
-        # shape: (b, n_head, 1, s)
-        # attn_weights = self._gqa_attn_weights(q, k_new, mask, b, src_s, n_qhead, n_kvhead)
-        topk = int(attn_sparsity * (src_s - 1))
+        topk = int(sparsity_config.sparsity * (src_s - 1))
         topk_weights, topk_indices = attn_weights[:, :, :, :-1].topk(
             topk, dim=-1, sorted=False)
         # (b, head, 1, k) -> (b* ngroup, group_head* k)
@@ -953,21 +964,13 @@ class TorchDevice:
             attn_weights[:, :, :, -1:]], dim=-1)
     
         # temporary on cuda, using only
-        
         v = extract_cache_to_bhsd(v_cache, b, n_kvhead, src_s, head_dim)
-        print(f" >>> shape of v: {v.shape}")
 
         # (b, head, k, d)
         v = select_topk(v, topk_indices)
-        print(f" >>> after select shape of v: {v.shape}")
 
         # (b, qhead, k+1, d)
         v_new = v_new.repeat_interleave(group_size, dim=1)
-        print(f" >>> in layer {layerno}")
-        # print(f" >>> shape of v: {v.shape}")
-        # print(f" >>> shape of v_new: {v_new.shape}")
-        print(f" >>> qhead: {n_qhead}")
-        print(f" >>> kvhead: {n_kvhead}")
         v = torch.concat([v, v_new], dim=2)
 
         attn_out = torch.bmm(
@@ -992,8 +995,8 @@ class TorchDevice:
         selected_k = self.allocate(selected_shape, dtype=k_new.dtype)
         selected_v = self.allocate(selected_shape, dtype=k_new.dtype)
         
-        selected_k = general_copy(selected_k, dst_indices=None, k_cache, selected_tokens)
-        selected_v = general_copy(selected_v, dst_indices=None, k_cache, selected_tokens)
+        selected_k = general_copy(selected_k, None, k_cache, selected_tokens)
+        selected_v = general_copy(selected_v, None, k_cache, selected_tokens)
 
         F.scaled_dot_product_attention(q, selected_k, selected_v)
         
@@ -1005,21 +1008,10 @@ class TorchDevice:
         """
         q, k, v: (b, head, s, h)
         """
-        b, n_qhead, tgt_s, head_dim = q.shape
-        src_s = mask.shape[-1]
-        n_kvhead = k_new.shape[1]
-
         if sparse_config.mode == "naive":
-            return _naive_sparse_gqa_value(w, v_new, 
-                k_cache, v_cache, mask, sparse_config.attn_sparsity, layerno, b, n_qhead, n_kvhead, src_s, tgt_s, head_dim)
+            return self._naive_sparse_gqa_value(q, k_new, v_new, k_cache, v_cache, mask, sparse_config, layerno)
         elif sparse_config.mode == "block":
             assert k_summary is not None
-
-            
-
-
-
-        
 
     def _mixed_device_attention(self, q, k_cache, v_cache, k_new, v_new,
             mask, b, src_s, tgt_s, n_head, head_dim):
