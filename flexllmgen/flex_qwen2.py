@@ -185,12 +185,8 @@ class SelfAttention:
             ((kv_dim,), dtype, attn_path + ".v_proj.bias"),
             # w_out
             ((h, h), dtype, attn_path + ".o_proj.weight"),
-            # b_out, o_proj have no bias in qwen2
-            # ((h,), dtype, path + ".out_proj.bias"),
             # w_ln
             ((h,), dtype, layer_path + ".input_layernorm.weight"),
-            # # b_ln, rms has no bias
-            # ((h,), dtype, path + "_layer_norm.bias"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
@@ -206,12 +202,25 @@ class SelfAttention:
                 w_v.smart_copy(dst1), b_v.smart_copy(dst2),
                 w_out.smart_copy(dst1), 
                 w_ln.smart_copy(dst2)))
-            # weight_read_buf.store((
-            #     w_q.smart_copy(dst1), b_q.smart_copy(dst2),
-            #     w_k.smart_copy(dst1), b_k.smart_copy(dst2),
-            #     w_v.smart_copy(dst1), b_v.smart_copy(dst2),
-            #     w_out.smart_copy(dst1), b_out.smart_copy(dst2),
-            #     w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
+
+    def load_weight_shift_qkvproj(self, weight_home, weight_red_buf, k):
+        if k == 0:
+            w_q, b_q, w_k, b_k, w_v, b_v, w_out, w_ln = weight_home.val
+            dst1 = self.weight_load_dst
+            dst2 = self.compute
+            weight_read_buf.store((
+                w_q.smart_copy(dst1), b_q.smart_copy(dst2),
+                w_k.smart_copy(dst1), b_k.smart_copy(dst2),
+                w_v.smart_copy(dst1), b_v.smart_copy(dst2),
+                w_ln.smart_copy(dst2)))
+
+    def load_weight_shift_oproj(self, weight_home, weight_read_buf, k):
+        if k == 0:
+            w_q, b_q, w_k, b_k, w_v, b_v, w_out, w_ln = weight_home.val
+            dst1 = self.weight_load_dst
+            dst2 = self.compute
+            weight_read_buf.store((
+                w_out.smart_copy(dst1),))
 
     def init_cache_one_gpu_batch(self, cache_home):
         if self.policy.cache_gpu_percent == 100:
@@ -320,9 +329,38 @@ class SelfAttention:
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
+
+    def forward_qkvproj(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+                position_embeddings, cache_write_buf, i, k):
+        donate = [False] * (1+1+1+5)
+        
+        h, donate[0] = hidden.val, True
+        
+        n_qhead = self.config.num_attention_heads
+        n_kvhead = self.config.num_key_value_heads
+
+        
+        if k == self.policy.num_gpu_batches - 1:
+            (( w_q, ), (b_q, False), 
+            (  w_k, False), (b_k, False),
+            (  w_v, False), (b_v, False),
+            (  w_ln, False)) = weight_read_buf.val.pop()
+        else:
+            ((w_q, _), (b_q, _), (w_k, _), (b_k, _), (w_v, _), (b_v, _), (w_ln, _) = weight_read_buf.val
+
+        if i == 0:
+            position_embed, donate[2] = position_embeddings.val.smart_copy(self.compute)
+            q, k, v= self.compute.qkv_proj(h, w_q, b_q, w_k, b_k, w_v, b_v, position_embeddings)
+            K_summary, v_summary = self.compute.kv_summary(k, v)
+            cache_write_buf.store((k, v, k_summary, v_summary))
+        else:
+            
+        
+        
+
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 position_embeddings, cache_write_buf, i, k):
-        # n_head = self.config.n_head
+        # forward-attn
         n_qhead = self.config.num_attention_heads
         n_kvhead = self.config.num_key_value_heads
 
@@ -351,7 +389,7 @@ class SelfAttention:
             cache_write_buf.store((new_k_cache, new_v_cache))
 
             dump_hidden(h.data,  "attn-output", self.layer_id)
-            # torch.save(h.data, f"my/layer-{self.layer_id}-attn-output")
+
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             position_embed, donate[2] = position_embeddings.val.smart_copy(self.compute)
@@ -361,12 +399,9 @@ class SelfAttention:
                 mask, position_embed, 
                 w_q, b_q, w_k, b_k, w_v, b_v, w_out, w_ln, 
                 (n_qhead, n_kvhead),
-                k_cache, 
-                v_cache, 
+                k_cache, v_cache, 
                 donate, 
-                self.policy.sparse_config,
-                self.policy.compress_cache, 
-                self.policy.comp_cache_config,
+                self.policy.sparse_config, self.policy.compress_cache, self.policy.comp_cache_config,
                 self.layer_id)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
@@ -441,6 +476,7 @@ class MLP:
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, position_embed,
                 cache_write_buf, i, k):
+        #forward-mlp
         donate = [False] * 7
         h, donate[0] = hidden.val, True
 
@@ -466,11 +502,12 @@ class MLP:
         dump_hidden(h.data, "final" , self.layer_id)
 
 class TransformerLayer:
-    def __init__(self, config, env, policy, i):
+    def __init__(self, config, env, policy, i, reordered=False):
         self.attention = SelfAttention(config, env, policy, i)
         self.mlp = MLP(config, env, policy, i)
         self.policy = policy
         self.compute = self.attention.compute
+        self.reordered = reordered
 
     def set_task(self, task):
         self.attention.set_task(task)
@@ -489,6 +526,32 @@ class TransformerLayer:
         self.mlp.load_weight(home2, read_buf2, k)
         if k == 0:
             weight_read_buf.store((read_buf1, read_buf2))
+
+    def load_ffn_weight(self, weight_home, weight_read_buf, k):
+        # weight_home: (attn-home, mlp-home)
+        mlp_read_buf = ValueHolder()
+        _, mlp_home = weight_home.val
+        self.mlp.load_weight(mlp_home, mlp_read_buf, k)
+
+        if k == 0:
+            if weight_read_buf.val is None:
+                attn_read_buf = ValueHolder()
+            else:
+                attn_read_buf, _ = weight_read_buf.val
+
+            weight_read_buf.store(attn_read_buf, mlp_read_buf))
+
+    def load_attn_weight(self, weight_home, weight_read_buf, k):
+        attn_read_buf = ValueHolder()
+        attn_home, _ = weight_home.val()
+        self.attention.load_weight(attn_home, attn_read_buf, k)
+        if k == 0:
+            if weight_read_buf.val is None:
+                mlp_read_buf = ValueHolder()
+            else:
+                _, mlp_read_buf = weight_read_buf.val
+
+            weight_read_buf.store((attn_read_buf, ml_read_buf))
 
     def init_cache_one_gpu_batch(self, cache_home):
         self.attention.init_cache_one_gpu_batch(cache_home)
@@ -513,8 +576,11 @@ class TransformerLayer:
         else:
             read_buf1, read_buf2 = weight_read_buf.val
 
-        self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask, position_embedding, 
-                               cache_write_buf, i, k)
+        if self.reordered:
+            
+        
+
+        self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask, position_embedding, cache_write_buf, i, k)
         self.mlp.forward(hidden, None, read_buf2, attention_mask, position_embedding, None,  i, k)
 
 class InputEmbed:
@@ -720,7 +786,17 @@ class QwenLM:
 
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
 
-    def load_weight(self, i, j, k, overlap=True):
+    def load_weight_shift(self, i, j, k , overlap=True):
+        if j == 0 or j == self.num_layers - 1:
+            self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
+        if j >= 1 and j < self.num_layers - 1:
+            assert isinstance(self.layers[j], TransformerLayer)
+            self.layers[j].load_ffn_weight(self.weight_home[j], self.weight_read_buf[j], k)
+        if j > self.num_layers-1:
+            self.layers[j+1].load_qkvproj_weight(self.weight_home[j+1], self.weight_read_buf[j+1], k)
+        
+
+    def load_weight(self, i, j, k, overlap=True):         # generate-load-weight
         # Handle corner cases
         if j == self.num_layers:
             j = 0
@@ -731,9 +807,15 @@ class QwenLM:
         # Load from weight_home to weight_read_buf
         if overlap:
             with torch.cuda.stream(self.load_weight_stream):
-                self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
+                if self.shift_forward:
+                    load_weight_shift(i, j, k, overlap)
+                else:
+                    self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
         else:
-            self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
+            if self.shift_forward:
+                load_weight_shift(i, j ,k, overlap)
+            else:
+                self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
 
     def delete_weight(self, j, k):
         if k == 0:
@@ -856,9 +938,27 @@ class QwenLM:
         # Clear the weight_read_buf if it is the last gpu batch
         # Clear the cache_read_buf
         # Run layer computation
-        self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
-            self.weight_read_buf[j], self.attention_mask[k], self.position_embedding[k], 
-            self.cache_write_buf[j][k], i, k)
+
+        # input/output embed layer
+        last_layer_no = len(self.layers) -1
+        if j == 0 or j == last_layer_no:
+            self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
+                self.weight_read_buf[j], self.attention_mask[k], self.position_embedding[k], 
+                self.cache_write_buf[j][k], i, k)
+
+            if j >= 1 and j < last_layer_no:
+            assert isinstance(self.layer[i], TransformerLayer)
+            self.layers[i].forward_after_proj(self.hidden[i][j][k], self.cache_read_buf[j][k],
+                self.weight_read_buf[j], self.attention_mask[k], self.position_embedding[k], 
+                self.cache_write_buf[j][k], i, k)
+
+            # use and update self.hidden[i][j][k]
+            # hidden will be moved to hidden[i][j+1][k] 
+            #   in store hidden and load hidden ( in generation loop)
+            if j + 1< last_layer_no :
+            self.layers[i+1].forward_proj_eval(self.hidden[i][j][k], self.cache_read_buf[j][k],
+                self.weight_read_buf[j], self.attention_mask[k], self.position_embedding[k], 
+                self.cache_write_buf[j][k], i, k)
 
     def sync(self):
         self.env.disk.synchronize()
@@ -961,11 +1061,14 @@ class QwenLM:
                 self.cache_home[j][k].clear()
                 self.cache_read_buf[j][k].clear()
                 self.cache_write_buf[j][k].clear()
+
         for j in range(num_layers):
             self.weight_read_buf[j].clear()
+
         for k in range(num_gpu_batches):
             self.attention_mask[k].clear()
             self.position_embedding[k].clear()
+
         self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
 
         # Init cache
@@ -1028,6 +1131,17 @@ class QwenLM:
                     self.store_hidden(i, j, k)
                     self.store_cache(i, j, k, overlap=False)
             timers("generate").stop()
+
+    def generation_loop_sparse_overlap_evaluation(self):
+        # prologue
+        # main loop
+        for i in range(self.execute_gen_len):
+            for j in range(self.num_layers):
+                for k in range(self.num_gpu_batches):
+                    compute_layer_from_attn(i, j, k)
+                    load_cache_sparse(i, j, k+1)
+                    store_cache(i, j, k-1)
+                    self.sync()
 
     def generation_loop_debug_normal(self):
         execute_num_batches = 20
@@ -1138,7 +1252,7 @@ class QwenLM:
                 break
 
     def generation_loop_overlap_multi_batch(self):
-        print(f" >>> loop overlap multi batch")
+        # generate-loop-overlap
         # Prologue
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)
