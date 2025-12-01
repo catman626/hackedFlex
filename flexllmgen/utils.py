@@ -305,3 +305,21 @@ def read_benchmark_log(filename):
         decode_latency, decode_throughput,
         total_latency, total_throughput,
     )
+
+def expand_block_idx(block_idx, block_size, return_form="BHN"):
+    # block_idx : (*, topk) -> (*, expanded_tokens)
+    prefix_shape = block_idx.shape[:-1]
+    topk = block_idx.shape[-1]
+
+    block_starts = block_idx * block_size
+    intra_block_idx = torch.arange(block_size)
+
+    expanded = block_starts.unsqueeze(-1) + intra_block_idx
+    expanded = expaned.flatten(-2)
+    if return_form == "BHN":
+        return expaned
+    else:
+        assert 0, "other return form not implmented"
+    # elif return_form == "idx":
+
+        

@@ -239,10 +239,48 @@ class SelfAttention:
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
         cache_home.store(cache)
 
+    def calculate_selected_token_ids(self, block_idx):
+        """ return (b, qhead, topk) """
+        block_idx = block_idx.val   # (b, head, topk)
+        block_size = self.policy.sparse_config.block_size
+        b, n_qhead, topk = block_idx.shape
+        src_s = self.prompt_len + i
+        tail_len = src_s % block_size
+        if tail_len > 0:
+            st = src_s // block_size * block_size
+            tails = torch.arange(st, st+tail_len)   # (ntail,)
+            
+        expanded_block = expand_block_idx(block_idx, self.policy.sparse_config.block_size)
+        selected_idx = torch.concat(
+                [expanded_block, tails.expand(b, n_qhead, tail_len)],  
+                dim=-1 )
+
+        return selected_idx
+
+    def load_selected_block(self, cache_home, cache_read_buf, i):
+        k_home, v_home, block_cache, idx_cache = cache_home.val
+
+        selected_idx = self.caculate_selected_token_ids( idx_cache.val)
+
+        cache_read_buf.store((
+            k_home.smart_copy(dst, (selected_idx, )),
+            v_home.smart_copy(dst, (selected_idx, )),
+        ))
+
+    def load_summary(self, cache_home, cache_read_buf, i):
+        k_cache, v_cache, block_cache, idx_cache = cache_home.val
+        cache_read_buf.store((
+            block_cache.smart_copy(dst),
+        )) 
+
     def load_cache(self, cache_home, cache_read_buf, i):
         if i == 0:  # prefill, no cache
             return
-
+        
+        if self.policy.sparse_config.mode == "block":
+            self.load_cache_block_sparse(cache_home, cache_read_buf, i)
+            return
+        
         k_home, v_home = cache_home.val
 
         # Pick code path
@@ -330,34 +368,51 @@ class SelfAttention:
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
 
+    
     def forward_qkvproj(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 position_embeddings, cache_write_buf, i, k):
-        donate = [False] * (1+1+1+5)
+        donate = [False] * (1+1+1+7)
+        # 0:hidden, 1:mask, 2:pos_embd, 345678 qkv_wb, 9 w_ln
         
         h, donate[0] = hidden.val, True
         
         n_qhead = self.config.num_attention_heads
         n_kvhead = self.config.num_key_value_heads
 
-        
         if k == self.policy.num_gpu_batches - 1:
-            (( w_q, ), (b_q, False), 
-            (  w_k, False), (b_k, False),
-            (  w_v, False), (b_v, False),
-            (  w_ln, False)) = weight_read_buf.val.pop()
+            (( w_q,  donate[3]), (b_q, donate[4]), 
+            (  w_k, donate[5]), (b_k, donate[6]),
+            (  w_v, donate[7]), (b_v, donate[8]),
+            (  w_ln, donate[9])) = weight_read_buf.val.pop()
         else:
             ((w_q, _), (b_q, _), (w_k, _), (b_k, _), (w_v, _), (b_v, _), (w_ln, _) = weight_read_buf.val
 
-        if i == 0:
-            position_embed, donate[2] = position_embeddings.val.smart_copy(self.compute)
-            q, k, v= self.compute.qkv_proj(h, w_q, b_q, w_k, b_k, w_v, b_v, position_embeddings)
-            K_summary, v_summary = self.compute.kv_summary(k, v)
-            cache_write_buf.store((k, v, k_summary, v_summary))
-        else:
-            
-        
-        
+        position_embed, donate[2] = position_embeddings.val.smart_copy(self.compute)
+        q, k, v= self.compute.qkv_proj(h, w_q, b_q, w_k, b_k, w_v, b_v, position_embeddings)
+        K_summary, v_summary = self.compute.kv_summary(k, v)
+        cache_write_buf.store((k, v, k_summary, v_summary))
 
+        hidden.val = q
+
+    def forward_attn(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+        position_embeddings, cache_write_buf, i, k):
+
+        donate = [False] * 4
+        # 0: q, 1:mask, 2: position_embed, 3:w_o
+
+        q, donate[0] = hidden.val, True
+        selected_k, selected_v = cache_read_buf.val
+        if k == self.policy.num_gpu_batches - 1:
+            ( (w_o, donate[3]), ) = weight_read_buf.pop()
+        else:
+            ( (w_o, )       ),  ) = weight_read_buf.pop()
+
+        if i == 0:
+            self.compute.gqa_after_proj(q, selected_k, selected_v, w_o  (n_qhead, n_kvhead), donate,
+                                                    self.policy.compress_cache, self.policy.comp_cache_config, self.layer_id)
+                
+
+            
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 position_embeddings, cache_write_buf, i, k):
         # forward-attn
@@ -556,6 +611,8 @@ class TransformerLayer:
     def init_cache_one_gpu_batch(self, cache_home):
         self.attention.init_cache_one_gpu_batch(cache_home)
         
+    def load_summary(self, cache_home, cache_read_buf, i):
+        self.attention.load_summary(cache_home, cache_read_buf, i)
 
     def load_cache(self, cache_home, cache_read_buf, i):
         self.attention.load_cache(cache_home, cache_read_buf, i)
@@ -828,6 +885,13 @@ class QwenLM:
 
     def init_cache(self, j, k):
         self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
+    
+    
+    def load_cache_block_sparse(self, i, j, k):
+        if j + 1 < self.num_layers - 1:
+            self.layers[j+1].load_summary(i, j+1, k)
+        if j >= 1 and j < self.num_layers - 1:
+            self.layers[j].load_cache_block_sparse(self.cache_home[j][k], self.cache_read_buf[j][k], i)
 
     def load_cache(self, i, j, k, overlap=True):
         # Handle corner cases
@@ -841,6 +905,13 @@ class QwenLM:
             i += 1
             if i == self.execute_gen_len:
                 return
+
+        if self.sparse_config.mode == "block":
+            if overlap:
+                with torch.cuda.stream(self.load_cache_stream):
+                    self.load_cache_block_sparse(i, j, k)
+            else:
+                self.load_cache_block_sparse(i, j, k)
 
         # Load from cache_home to cache_read_buf
         if overlap:
@@ -1132,16 +1203,20 @@ class QwenLM:
                     self.store_cache(i, j, k, overlap=False)
             timers("generate").stop()
 
-    def generation_loop_sparse_overlap_evaluation(self):
+    def generation_loop_block_sparse(self):
+        # use config to determine which to use
+        return self.generation_loop_overlap_multi_batch()
         # prologue
         # main loop
-        for i in range(self.execute_gen_len):
-            for j in range(self.num_layers):
-                for k in range(self.num_gpu_batches):
-                    compute_layer_from_attn(i, j, k)
-                    load_cache_sparse(i, j, k+1)
-                    store_cache(i, j, k-1)
-                    self.sync()
+        # for i in range(self.execute_gen_len):
+            # for j in range(self.num_layers):
+                # for k in range(self.num_gpu_batches):
+                    # compute_layer_from_attn(i, j, k)
+                    # load_cache_sparse(i, j, k+1)
+                    # store_cache(i, j, k-1)
+                    # self.sync()
+
+
 
     def generation_loop_debug_normal(self):
         execute_num_batches = 20
@@ -1561,7 +1636,7 @@ def add_parser_arguments(parser):
         const=True, default=True)
 
     parser.add_argument("--cpu-cache-compute", action="store_true")
-    parser.add_argument("--sparse-mode", type=str, default="dense")
+    parser.add_argument("--sparse-mode", type=str, choices=["dense", "naive", "block"], default="dense")
     parser.add_argument("--attn-sparsity", type=float, default=1.0)
     parser.add_argument("--sparse-block-size", type=int, default=64)
     

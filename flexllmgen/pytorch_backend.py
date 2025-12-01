@@ -15,7 +15,7 @@ import numpy as np
 
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
-    torch_dtype_to_num_bytes)
+    torch_dtype_to_num_bytes, expand_block_idx)
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -102,20 +102,6 @@ def select_topk(v:torch.Tensor, indices:torch.Tensor):
     #     f" >>>>>> idx_b: {idx_b.shape}, idx_h: {idx_h.shape}, idx_k:{idx_k.shape}"
 
     return v[idx_b, idx_h, idx_k]
-
-def expand_block_idx(block_idx, block_size):
-    # block_idx : (*, topk)
-    prefix_shape = block_idx.shape[:-1]
-    topk = block_idx.shape[-1]
-
-    block_starts = block_idx * block_size
-    intra_block_idx = torch.arange(block_size)
-
-    expanded = block_starts.unsqueeze(-1) + intra_block_idx
-    expanded = expaned.flatten(-2)
-
-    return expaned
-    
 
 #def evaluate(q, k):
     #""" both in BHND """
@@ -468,8 +454,97 @@ class TorchDevice:
 
         k_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
         v_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
+        
+        # adding block cache
+        if self.policy.sparse_config.mode == "block":
+            # the s%block_sz tokens must be indiced
+            num_block = (prompt_len + gen_len) // policy.sparse_config.block_size + block_size
+            
+            block_cache = self.alloc(
+                    shape=(num_block, gpu_batch_size * n_kvhead, hidden_size // n_qhead), 
+                    config.dtype, pin_memory=pin_memory)
+            idx_cache = self.alloc(
+                    shape=(num_block, gpu_batch_size * n_kvhead)
+                    np.int, pin_memory=pin_memory)
 
-        return k_cache, v_cache
+            return k_cache, v_cache, block_cache, idx_cache
+        else:
+            return k_cache, v_cache
+    def qkv_proj(self, inputs, attention_mask, position_embed, w_q, b_q, w_k, b_k, w_v, b_v, w_ln):
+        n_qhead, n_kvhead = n_head
+        
+        b, s, h = inputs.shape
+        head_dim = h//n_qhead
+        cos = position_embed.data[0][:s]
+        sin = position_embed.data[1][:s]
+
+        hidden =  rms_layernorm(inputs.data, w_ln.data)
+    
+        # shape: (b, s, h)
+        q = F.linear(hidden, w_q.data, bias=b_q.data) 
+        k = F.linear(hidden, w_k.data, bias=b_k.data)
+        v = F.linear(hidden, w_v.data, bias=b_v.data)
+        # shape: (b, s, n_head, head_dim) -> (b, head, s, head_dim)
+        q = q.view(b, s, n_qhead,  head_dim).transpose(1,2)
+        k = k.view(b, s, n_kvhead, head_dim).transpose(1,2)
+        v = v.view(b, s, n_kvhead, head_dim).transpose(1,2)
+
+        # (b, head, s, d)
+        q_pos = apply_rope(q, (cos, sin), unsqueeze_dim=0)
+        k_pos = apply_rope(k, (cos, sin), unsqueeze_dim=0)
+
+
+        # (s, b*head, d)
+        k_pos = bhsd_to_cache_shape(k_pos)
+        v     = bhsd_to_cache_shape(v    )
+
+        
+        q_pos = TorchTensor.create_from_torch(q_pos, self)
+        k_pos = TorchTensor.create_from_torch(k_pos, self)
+        v     = TorchTensor.create_from_torch(v,     self)
+        
+        return q_pos, k_pos, v
+
+    def kv_summary(self, k:TorchTensor, v:TorchTensor, block_size)
+        """ k, v: (s, b*h, d) """
+        k = k.data
+        v = v.data
+        num_block = s // block_size
+        k_shape = k.shape
+        k = k[:num_block*block_size]
+        v = v[:num_block*block_size]
+
+        cache_shape = k.shape
+        k = k.view(num_block, block_size, *cache_shape)
+        v = v.view(num_block, block_size, *cache_shape)
+        
+        k = k.mean(dim=1)
+        v = v.mean(dim=1)
+        
+        return TorchTensor.create_from_torch(k, self), TorchTensor.create_from_torch(v, self)
+
+
+    def gqa_after_proj(self, q, k, v, w_o):
+        """ q: (b, head, s, d)
+            kv:(s, b*head, d)
+            
+        """
+        q = q.data
+        b, n_head, s, head_dim = q.shape
+
+        k = k.view(s, b, n_head, head_dim).permute(1, 2, 0, 3)
+        v = v.view(s, b, n_head, head_dim).permute(1, 2, 0, 3)
+        
+
+        # (b, head, s, d)
+        attn_output = F.sacled_dot_product_attention(q, k, v)
+
+        # -> (b, s, D) 
+        attn_output = attn_output.permute(0, 2, 1, 3).view(b, s, n_head*head_dim)
+
+        output = F.linear(attn_output, w_o.data)
+        
+        return TorchTensor.from_torch(output, self)
 
     def gqa(self, inputs, attention_mask, position_embed, w_q, b_q, w_k, b_k, w_v, b_v,
             w_out, w_ln, n_head, donate, compress_cache, comp_config, layerno):
@@ -1378,7 +1453,8 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
     else:
         # The normal path
         if isinstance(src_indices, tuple):
-            src = src.data[*src_indices]
+            src = select_topk(src.data, src_indices[0])
+            # src = src.data[*src_indices]
         else:
             src = src.data[src_indices] if src_indices is not None else src.data
 
