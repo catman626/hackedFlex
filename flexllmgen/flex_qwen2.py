@@ -385,7 +385,7 @@ class SelfAttention:
             (  w_v, donate[7]), (b_v, donate[8]),
             (  w_ln, donate[9])) = weight_read_buf.val.pop()
         else:
-            ((w_q, _), (b_q, _), (w_k, _), (b_k, _), (w_v, _), (b_v, _), (w_ln, _) = weight_read_buf.val
+            ((w_q, _), (b_q, _), (w_k, _), (b_k, _), (w_v, _), (b_v, _), (w_ln, _) 0= weight_read_buf.val
 
         position_embed, donate[2] = position_embeddings.val.smart_copy(self.compute)
         q, k, v= self.compute.qkv_proj(h, w_q, b_q, w_k, b_k, w_v, b_v, position_embeddings)
@@ -401,16 +401,17 @@ class SelfAttention:
         # 0: q, 1:mask, 2: position_embed, 3:w_o
 
         q, donate[0] = hidden.val, True
+
+        # temporarily, P/D both store and load
         selected_k, selected_v = cache_read_buf.val
         if k == self.policy.num_gpu_batches - 1:
             ( (w_o, donate[3]), ) = weight_read_buf.pop()
         else:
-            ( (w_o, )       ),  ) = weight_read_buf.pop()
+            ( (w_o, _       ),  ) = weight_read_buf.pop()
 
-        if i == 0:
-            self.compute.gqa_after_proj(q, selected_k, selected_v, w_o  (n_qhead, n_kvhead), donate,
-                                                    self.policy.compress_cache, self.policy.comp_cache_config, self.layer_id)
-                
+        h = self.compute.gqa_after_proj(q, selected_k, selected_v, w_o)        
+
+        hidden.val = h
 
             
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
@@ -594,7 +595,7 @@ class TransformerLayer:
             else:
                 attn_read_buf, _ = weight_read_buf.val
 
-            weight_read_buf.store(attn_read_buf, mlp_read_buf))
+            weight_read_buf.store((attn_read_buf, mlp_read_buf))
 
     def load_attn_weight(self, weight_home, weight_read_buf, k):
         attn_read_buf = ValueHolder()

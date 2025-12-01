@@ -527,7 +527,6 @@ class TorchDevice:
     def gqa_after_proj(self, q, k, v, w_o):
         """ q: (b, head, s, d)
             kv:(s, b*head, d)
-            
         """
         q = q.data
         b, n_head, s, head_dim = q.shape
@@ -535,9 +534,8 @@ class TorchDevice:
         k = k.view(s, b, n_head, head_dim).permute(1, 2, 0, 3)
         v = v.view(s, b, n_head, head_dim).permute(1, 2, 0, 3)
         
-
         # (b, head, s, d)
-        attn_output = F.sacled_dot_product_attention(q, k, v)
+        attn_output = F.sacled_dot_product_attention(q, k, v, )
 
         # -> (b, s, D) 
         attn_output = attn_output.permute(0, 2, 1, 3).view(b, s, n_head*head_dim)
