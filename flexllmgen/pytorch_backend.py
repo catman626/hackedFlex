@@ -456,16 +456,19 @@ class TorchDevice:
         v_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
         
         # adding block cache
-        if self.policy.sparse_config.mode == "block":
+        if policy.sparse_config.mode == "block":
             # the s%block_sz tokens must be indiced
-            num_block = (prompt_len + gen_len) // policy.sparse_config.block_size + block_size
+            block_size=  policy.sparse_config.block_size 
+            num_block = (prompt_len + gen_len) // block_size + block_size
             
-            block_cache = self.alloc(
-                    shape=(num_block, gpu_batch_size * n_kvhead, hidden_size // n_qhead), 
-                    config.dtype, pin_memory=pin_memory)
-            idx_cache = self.alloc(
-                    shape=(num_block, gpu_batch_size * n_kvhead)
-                    np.int, pin_memory=pin_memory)
+            block_cache = self.allocate(
+                    (num_block, gpu_batch_size * n_kvhead, hidden_size // n_qhead), 
+                    config.dtype, 
+                    pin_memory=pin_memory)
+            idx_cache = self.allocate(
+                    (num_block, gpu_batch_size * n_kvhead), 
+                    np.int32, 
+                    pin_memory=pin_memory)
 
             return k_cache, v_cache, block_cache, idx_cache
         else:
@@ -505,7 +508,7 @@ class TorchDevice:
         
         return q_pos, k_pos, v
 
-    def kv_summary(self, k:TorchTensor, v:TorchTensor, block_size)
+    def kv_summary(self, k:TorchTensor, v:TorchTensor, block_size):
         """ k, v: (s, b*h, d) """
         k = k.data
         v = v.data
