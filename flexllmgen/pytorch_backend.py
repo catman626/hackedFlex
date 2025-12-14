@@ -428,6 +428,33 @@ class TorchDevice:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
+    def init_cache_one_gpu_batch_qwen(self, config, task, policy):
+        n_qhead, n_kvhead, hidden_size, prompt_len, gen_len, gpu_batch_size = (
+                config.num_attention_heads, config.num_key_value_heads, config.hidden_size, task.prompt_len, task.gen_len,
+                policy.gpu_batch_size)
+
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * n_kvhead, hidden_size // n_qhead)
+
+        pin_memory = False
+        k_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
+        v_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
+
+        # the s%block_sz tokens must be indiced
+        block_size = policy.sparse_config.block_size 
+        num_block = (prompt_len + gen_len) // block_size + block_size
+        
+        k_summary_cache = self.allocate(
+                (num_block, gpu_batch_size * n_kvhead, hidden_size // n_qhead), 
+                config.dtype, pin_memory=pin_memory)
+        v_summary_cache = self.allocate(
+                (num_block, gpu_batch_size * n_kvhead, hidden_size // n_qhead), 
+                config.dtype, pin_memory=pin_memory)
+        idx_cache = self.allocate(
+                (num_block, gpu_batch_size * n_kvhead),
+                np.int32, pin_memory=pin_memory)
+
+        return k_cache, v_cache, k_summary_cache, v_summary_cache, idx_cache
+
     def init_cache_one_gpu_batch(self, config, task, policy):
         if config.name.startswith("opt"):
             n_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
@@ -436,15 +463,6 @@ class TorchDevice:
                     )
             shape = (prompt_len + gen_len-1, gpu_batch_size *n_head, hidden_size//n_head)
 
-        elif config.name.startswith("qwen"):
-            n_qhead, n_kvhead, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-                    config.num_attention_heads, config.num_key_value_heads, config.hidden_size, task.prompt_len, task.gen_len,
-                    policy.gpu_batch_size)
-
-            shape = (prompt_len + gen_len - 1, gpu_batch_size * n_kvhead, hidden_size // n_qhead)
-        else:
-            assert 0, f"invalid config.name: {config.name}"
-
         # print(f" >>> init cache in shape: {shape}")
         # shape = cache_shape(config, task, policy)
         # NOTE: disable pin_memory due to high memory overhead
@@ -452,22 +470,8 @@ class TorchDevice:
         k_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
         v_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
 
-        # adding block cache
-        if policy.sparse_config.mode == "block":
-            # the s%block_sz tokens must be indiced
-            block_size = policy.sparse_config.block_size 
-            num_block = (prompt_len + gen_len) // block_size + block_size
-            
-            block_cache = self.allocate(
-                    (num_block, gpu_batch_size * n_kvhead, hidden_size // n_qhead), 
-                    config.dtype, pin_memory=pin_memory)
-            idx_cache = self.allocate(
-                    (num_block, gpu_batch_size * n_kvhead),
-                    np.int32, pin_memory=pin_memory)
+        return k_cache, v_cache
 
-            return k_cache, v_cache, block_cache, idx_cache
-        else:
-            return k_cache, v_cache
     def qkv_proj(self, inputs, attention_mask, position_embed, w_q, b_q, w_k, b_k, w_v, b_v, w_ln):
         n_qhead, n_kvhead = n_head
         
@@ -500,9 +504,44 @@ class TorchDevice:
         v     = TorchTensor.create_from_torch(v,     self)
         
         return q_pos, k_pos, v
+    
+    def update_summary(self, new_k, new_v, k_summary, v_summary, i, prompt_len, block_size):
+        """ summary in shape: (b, head, s, d) """
+        b, n_head, s, head_dim = k_summary.shape
+        s_tgt = new_k.shape[2]
+        assert s_tgt == 1
+
+        context_len = prompt_len + i
+        num_block = context_len // block_size
+
+        tail_len = s - num_block + s_tgt
+        tail_k = torch.concat([k_summary[:, :, num_block:], new_k], dim=2)
+        tail_v = torch.concat([v_summary[:, :, num_block:], new_v], dim=2)
+
+        
+        num_new_block = tail_len // block_size
+        if num_new_block > 0:
+            new_k_block = tail_k[:, :, :num_new_block*block_size].mean(dim=2, keep_dim=True)
+            new_v_block = tail_v[:, :, :num_new_block*block_size].mean(dim=2, keep_dim=True)
+            
+            new_k_tail = tail_k[:, :, num_new_block*block_size: ]
+            new_v_tail = tail_v[:, :, num_new_block*block_size:]
+
+            new_k_summary = torch.concat([k_summary[:,:,num_block:], new_k_block, new_k_tail], dim=2)
+            new_v_summary = torch.concat([v_summary[:,:,num_block:], new_v_block, new_v_tail], dim=2)
+
+        else:
+            new_k_summary = torch.concat([k_summary, new_k], dim=2)
+            new_v_summary = torch.concat([v_summary, new_v], dim=2)
+
+            
+        return TorchTensor.create_from_torch(new_k_summary, self), TorchTensor.create_from_torch(new_v_summary, self)
+        
+        
 
     def kv_summary(self, k:TorchTensor, v:TorchTensor, block_size):
         """ k, v: (s, b*h, d) """
+
         k = k.data
         v = v.data
         num_block = s // block_size
