@@ -70,8 +70,18 @@ class QwenConfig :
         element_size = np.dtype(self.dtype).itemsize
         return batch_size * seq_len * self.hidden_size * element_size_of(self.dtype)
 
+def extract_name_from_path(pathname):
+    import re
+    pattern = r"models--(.*?)--(.*?)/"
+    match = re.search(pattern, pathname)
+    usrname = match.group(1)
+    model_name = match.group(2)
+    print(f" >>> extracted username: {usrname}, model_name: {model_name}")
+    return f"{usrname}/{model_name}"
 
 def get_qwen_config(name):
+    if os.path.exists(name):
+        name = extract_name_from_path(name)
     if "/" in name:
         name = name.split("/")[-1]
     name = name.lower()

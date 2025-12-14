@@ -431,16 +431,16 @@ class TorchDevice:
     def init_cache_one_gpu_batch(self, config, task, policy):
         if config.name.startswith("opt"):
             n_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-                config.n_head, config.hidden_size, task.prompt_len, task.gen_len,
-                policy.gpu_batch_size
-            )
+                    config.n_head, config.hidden_size, task.prompt_len, task.gen_len,
+                    policy.gpu_batch_size
+                    )
             shape = (prompt_len + gen_len-1, gpu_batch_size *n_head, hidden_size//n_head)
 
         elif config.name.startswith("qwen"):
             n_qhead, n_kvhead, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-                config.num_attention_heads, config.num_key_value_heads, config.hidden_size, task.prompt_len, task.gen_len,
-                policy.gpu_batch_size)
-        
+                    config.num_attention_heads, config.num_key_value_heads, config.hidden_size, task.prompt_len, task.gen_len,
+                    policy.gpu_batch_size)
+
             shape = (prompt_len + gen_len - 1, gpu_batch_size * n_kvhead, hidden_size // n_qhead)
         else:
             assert 0, f"invalid config.name: {config.name}"
@@ -449,26 +449,21 @@ class TorchDevice:
         # shape = cache_shape(config, task, policy)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
-        # k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
-        # v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
-
         k_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
         v_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
-        
+
         # adding block cache
         if policy.sparse_config.mode == "block":
             # the s%block_sz tokens must be indiced
-            block_size=  policy.sparse_config.block_size 
+            block_size = policy.sparse_config.block_size 
             num_block = (prompt_len + gen_len) // block_size + block_size
             
             block_cache = self.allocate(
                     (num_block, gpu_batch_size * n_kvhead, hidden_size // n_qhead), 
-                    config.dtype, 
-                    pin_memory=pin_memory)
+                    config.dtype, pin_memory=pin_memory)
             idx_cache = self.allocate(
-                    (num_block, gpu_batch_size * n_kvhead), 
-                    np.int32, 
-                    pin_memory=pin_memory)
+                    (num_block, gpu_batch_size * n_kvhead),
+                    np.int32, pin_memory=pin_memory)
 
             return k_cache, v_cache, block_cache, idx_cache
         else:
@@ -496,11 +491,9 @@ class TorchDevice:
         q_pos = apply_rope(q, (cos, sin), unsqueeze_dim=0)
         k_pos = apply_rope(k, (cos, sin), unsqueeze_dim=0)
 
-
         # (s, b*head, d)
         k_pos = bhsd_to_cache_shape(k_pos)
         v     = bhsd_to_cache_shape(v    )
-
         
         q_pos = TorchTensor.create_from_torch(q_pos, self)
         k_pos = TorchTensor.create_from_torch(k_pos, self)
@@ -526,7 +519,6 @@ class TorchDevice:
         
         return TorchTensor.create_from_torch(k, self), TorchTensor.create_from_torch(v, self)
 
-
     def gqa_after_proj(self, q, k, v, w_o):
         """ q: (b, head, s, d)
             kv:(s, b*head, d)
@@ -536,13 +528,12 @@ class TorchDevice:
 
         k = k.view(s, b, n_head, head_dim).permute(1, 2, 0, 3)
         v = v.view(s, b, n_head, head_dim).permute(1, 2, 0, 3)
-        
+
         # (b, head, s, d)
-        attn_output = F.sacled_dot_product_attention(q, k, v, )
+        attn_output = F.sacled_dot_product_attention(q, k, v)
 
-        # -> (b, s, D) 
-        attn_output = attn_output.permute(0, 2, 1, 3).view(b, s, n_head*head_dim)
-
+        # 
+        attn_output = attn_output.permute(0, 2, 1, 3).view(b, s, m_head * head_dim)
         output = F.linear(attn_output, w_o.data)
         
         return TorchTensor.from_torch(output, self)
