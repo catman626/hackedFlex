@@ -331,11 +331,11 @@ class DistOptLM(OptLM):
         # The following buffers store values used
         # for the i-th token, j-th layer, k-th gpu batch, t-th stage.
         # cache[t][j][k]
-        self.cache_home = array_3d(num_inner_iterations, num_layers, num_gpu_batches, ValueHolder)
-        self.cache_read_buf = array_3d(num_inner_iterations, num_layers, num_gpu_batches, ValueHolder)
-        self.cache_write_buf = array_3d(num_inner_iterations, num_layers, num_gpu_batches, ValueHolder)
+        self.cache_home =       array_3d(num_inner_iterations, num_layers, num_gpu_batches, ValueHolder)
+        self.cache_read_buf =   array_3d(num_inner_iterations, num_layers, num_gpu_batches, ValueHolder)
+        self.cache_write_buf =  array_3d(num_inner_iterations, num_layers, num_gpu_batches, ValueHolder)
         # weight[j]
-        self.weight_read_buf = array_1d(num_layers, ValueHolder)
+        self.weight_read_buf =  array_1d(num_layers, ValueHolder)
         # hidden[t][i][j][k]
         self.hidden = array_4d(num_inner_iterations, gen_len, num_layers, num_gpu_batches, ValueHolder)
         # attention_mask[t][k]
@@ -645,7 +645,6 @@ def run_flexllmgen_dist(args):
             log_filename = args.log_file
         with open(log_filename, "a") as fout:
             fout.write(log_str + "\n")
-
 
 def add_distributed_parser_arguments(parser):
     parser.add_argument('--head-ip', type=str, default=None, help='the IP address of the head node')

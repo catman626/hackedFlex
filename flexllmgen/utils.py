@@ -307,7 +307,9 @@ def read_benchmark_log(filename):
     )
 
 def expand_block_idx(block_idx, block_size, return_form="BHN"):
-    # block_idx : (*, topk) -> (*, expanded_tokens)
+    """ 
+    block_idx -> token-idx
+    block_idx : (*, topk) -> (*, expanded_tokens) """
     prefix_shape = block_idx.shape[:-1]
     topk = block_idx.shape[-1]
 
@@ -315,11 +317,13 @@ def expand_block_idx(block_idx, block_size, return_form="BHN"):
     intra_block_idx = torch.arange(block_size)
 
     expanded = block_starts.unsqueeze(-1) + intra_block_idx
-    expanded = expaned.flatten(-2)
+    expanded = expanded.flatten(-2)
     if return_form == "BHN":
-        return expaned
+        return expanded
     else:
         assert 0, "other return form not implmented"
     # elif return_form == "idx":
+
+
 
         
