@@ -15,7 +15,8 @@ import numpy as np
 
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
-    torch_dtype_to_num_bytes, expand_block_idx)
+    torch_dtype_to_num_bytes, expand_block_idx, ValueHolder, num_block, 
+    bhsd_to_cache_shape, tail_length, bhsd_to_bsH)
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -49,6 +50,10 @@ def dump_hidden(torch_obj, name, layerno=None, seq_len=None):
         print(log_info)
 
     torch.save(torch_obj, save_name)
+ 
+def repeat_interleave(kv_data, n_qhead, n_kvhead):
+    assert len(kv_data.shape) == 4
+    return torch.repeat_interleave(kv_data, n_qhead//n_kvhead, dim=1)
 
 def fix_recursive_import():
     global general_copy_compressed, TorchCompressedDevice, global_cpu_device
@@ -56,9 +61,9 @@ def fix_recursive_import():
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
 
-def derive_shapes(q, k, mask):
+def derive_shapes(q, k):
     b, n_qhead, tgt_s, head_dim = q.shape
-    src_s = mask.shape[-1]
+    src_s = k.shape[2]
     n_kvhead = k.shape[1]
 
     return b, n_qhead, n_kvhead, tgt_s, src_s, head_dim
@@ -76,10 +81,6 @@ def extract_cache_to_bhsd(cache, b, n_head, s, d):
   
     # k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
 
-def bhsd_to_cache_shape(cache):
-    b, h, s, d = cache.shape
-    c = cache.permute(2, 0, 1, 3).reshape(s, b*h, d)
-    return c
 
 def select_topk(v:torch.Tensor, indices:torch.Tensor):
     """
@@ -103,6 +104,45 @@ def select_topk(v:torch.Tensor, indices:torch.Tensor):
 
     return v[idx_b, idx_h, idx_k]
 
+def copy_indices_to_shape(indices:Tuple, src_shape):
+    shape = list(src_shape)
+    if isinstance(indices, tuple):
+        for i, idx in enumerate(indices):
+            if idx.stop is not None:
+                shape[i] = idx.stop - idx.start
+        return tuple(shape)
+        
+    elif  isinstance(indices, TorchTensor):
+        raise NotImplementedError()
+    elif isinstance(indices, torch.Tensor):
+        assert len(indices.shape) == 3 
+        head_dim = src_shape[-1]
+
+        dst_shape = indices.shape + (head_dim, )
+        return dst_shape
+    else :
+        print(f" >>> idx type: {type(indices)}")
+        raise NotImplementedError()
+
+def index_into(data:torch.Tensor, idx, ensure_view=False):
+    if isinstance(idx, torch.Tensor):
+        # case of block sparse
+        assert not ensure_view 
+        n_kvhead, head_dim = data.shape[1], data.shape[-1]
+        n_qhead = idx.shape[1]
+        
+        selected = data.repeat_interleave(n_qhead//n_kvhead, dim=1)\
+                        .gather(dim=-2, 
+                                index=idx.unsqueeze(-1).expand(-1,-1,-1,head_dim))
+
+    elif isinstance(idx, tuple):
+        selected = data[idx] 
+    else :
+        raise NotImplementedError()
+
+    return selected
+
+        
 class DeviceType(Enum):
     CPU = auto()
     CUDA = auto()
@@ -201,10 +241,8 @@ class TorchTensor:
             self.load_from_np(np.load(filename))
 
     def copy(self, dst, src_indices=None):
-        if src_indices:
-            assert all(x.step is None for x in src_indices)
-            shape = tuple(x.stop - x.start for x in src_indices
-                ) + self.shape[len(src_indices):]
+        if src_indices is not None:
+            shape = copy_indices_to_shape(src_indices, self.shape)
         else:
             shape = self.shape
 
@@ -422,7 +460,8 @@ class TorchDevice:
 
     def init_cache_one_gpu_batch_qwen(self, config, task, policy):
         n_qhead, n_kvhead, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-                config.num_attention_heads, config.num_key_value_heads, config.hidden_size, task.prompt_len, task.gen_len,
+                config.num_attention_heads, config.num_key_value_heads, config.hidden_size, 
+                task.prompt_len, task.gen_len,
                 policy.gpu_batch_size)
 
         head_dim = hidden_size // n_qhead
@@ -442,10 +481,10 @@ class TorchDevice:
                 summary_shape, 
                 config.dtype, pin_memory=pin_memory)
         idx_cache = self.allocate(
-                (num_block, gpu_batch_size*n_kvhead),
+                (gpu_batch_size, n_qhead, prompt_len+gen_len),
                 np.int32, pin_memory=pin_memory)
 
-        return k_cache, v_cache, summary_cache, idx_cache
+        return k_cache, v_cache, summary_cache, (idx_cache, ValueHolder())
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         if config.name.startswith("qwen"):
@@ -467,21 +506,30 @@ class TorchDevice:
 
         return k_cache, v_cache
 
-    def qkv_proj(self, inputs, attention_mask, position_embed, w_q, b_q, w_k, b_k, w_v, b_v, w_ln, n_head):
-        """ return q:(bhsd)"""
-        n_qhead, n_kvhead = n_head
-        
-        b, s, h = inputs.shape
-        head_dim = h//n_qhead
-        cos = position_embed.data[0][:s]
-        sin = position_embed.data[1][:s]
+    def out_proj(self, h, w_o):
+        h = F.linear(h.data, w_o.data)
 
-        hidden =  rms_layernorm(inputs.data, w_ln.data)
-    
+        return TorchTensor.create_from_torch(h, self)
+        
+
+    def _qkv_proj(self, h, 
+                 attn_mask, position_embed, 
+                 w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
+                 n_head, return_form="bhsd"):
+        """ input, return:  torch.tensor
+            return: (b, h, s, d) 
+        """
+        hidden =  rms_layernorm(h, w_ln)
+        cos, sin = position_embed
+        n_qhead, n_kvhead = n_head
+        b, s, h = h.shape
+        head_dim = h//n_qhead
+
         # shape: (b, s, h)
-        q = F.linear(hidden, w_q.data, bias=b_q.data) 
-        k = F.linear(hidden, w_k.data, bias=b_k.data)
-        v = F.linear(hidden, w_v.data, bias=b_v.data)
+        q = F.linear(hidden, w_q, bias=b_q) 
+        k = F.linear(hidden, w_k, bias=b_k)
+        v = F.linear(hidden, w_v, bias=b_v)
+
         # shape: (b, s, n_head, head_dim) -> (b, head, s, head_dim)
         q = q.view(b, s, n_qhead,  head_dim).transpose(1,2)
         k = k.view(b, s, n_kvhead, head_dim).transpose(1,2)
@@ -491,100 +539,201 @@ class TorchDevice:
         q_pos = apply_rope(q, (cos, sin), unsqueeze_dim=0)
         k_pos = apply_rope(k, (cos, sin), unsqueeze_dim=0)
 
-        q_pos = TorchTensor.create_from_torch(q_pos, self)
-        k_pos = TorchTensor.create_from_torch(k_pos, self)
-        v     = TorchTensor.create_from_torch(v,     self)
+        if return_form == "bsH":
+            q_pos = bhsd_to_bsH(q_pos)
+            k_pos = bhsd_to_bsH(k_pos)
+            v = bhsd_to_bsH(v)
+
+        return q_pos, k_pos, v 
+
+    def qkv_proj_prefill(self, h, attn_mask, position_embed, 
+                         w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
+                         n_head, enable_sparse=False, block_size=0):
+        """ return q:(bsH)"""
+        assert len(h.shape) == 3
+        b, s, hidden_dim = h.shape
+        n_qhead, n_kvhead = n_head
+        head_dim = hidden_dim // n_qhead
+
+        cos = position_embed.data[0][:s]
+        sin = position_embed.data[1][:s]
+
+        mask = attn_mask.data if attn_mask is not None else None
+        q, k, v = self._qkv_proj(h.data, mask, (cos, sin), 
+                                 w_q.data, b_q.data, w_k.data, b_k.data, w_v.data, b_v.data, w_ln.data,
+                                 n_head)
         
-        return q_pos, k_pos, v
-    
-    def update_summary(self, new_k, new_v, k_summary, v_summary, i, prompt_len, block_size):
-        """ summary in shape: (b, head, s, d) """
-        b, n_head, s, head_dim = k_summary.shape
-        s_tgt = new_k.shape[2]
-        assert s_tgt == 1
-
-        context_len = prompt_len + i
-        num_block = context_len // block_size
-
-        tail_len = s - num_block + s_tgt
-        tail_k = torch.concat([k_summary[:, :, num_block:], new_k], dim=2)
-        tail_v = torch.concat([v_summary[:, :, num_block:], new_v], dim=2)
-
-        
-        num_new_block = tail_len // block_size
-        if num_new_block > 0:
-            new_k_block = tail_k[:, :, :num_new_block*block_size].mean(dim=2, keep_dim=True)
-            new_v_block = tail_v[:, :, :num_new_block*block_size].mean(dim=2, keep_dim=True)
+        if enable_sparse:
+            last_q = q[:, :, -block_size:]
+            k1 = torch.repeat_interleave(k, n_qhead//n_kvhead, dim=1)
+            attn_score = torch.matmul(last_q, k1.transpose(2, 3))
+            n_sample_kv = s//10
             
-            new_k_tail = tail_k[:, :, num_new_block*block_size: ]
-            new_v_tail = tail_v[:, :, num_new_block*block_size:]
 
-            new_k_summary = torch.concat([k_summary[:,:,num_block:], new_k_block, new_k_tail], dim=2)
-            new_v_summary = torch.concat([v_summary[:,:,num_block:], new_v_block, new_v_tail], dim=2)
+            q = q * (head_dim ** -0.5)
+            sparse_attn_score = torch.matmul(q, k1[:,:,-n_sample_kv:].transpose(2,3)    ) 
+
+            # (b, h, s, k)
+            attn_weight = torch.softmax(sparse_attn_score, dim=-1)
+
+            print(f" >>> n-sample-kv:{n_sample_kv}")
+
+            # (b, h, s, k) * (b, h, k, d) -> (b, h, s, d)
+            v1 = repeat_interleave(v[:, :, -n_sample_kv:], n_qhead, n_kvhead)
+
+            print(f" >>> shape of attn_weight: {attn_weight.shape}")
+            attn_out = torch.matmul(attn_weight, v1)
+
+            attn_out = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
+
+            tail_len = s % block_size + block_size
+            n_blk = num_block(s, block_size)
+            summary = k[:,:,:-tail_len].reshape(b, n_kvhead, n_blk, block_size, head_dim).mean(dim=-2)
+
+            print(f" >>> shape of summary: {summary.shape}")
+            
+            summary = TorchTensor.create_from_torch(summary, self)
 
         else:
-            new_k_summary = torch.concat([k_summary, new_k], dim=2)
-            new_v_summary = torch.concat([v_summary, new_v], dim=2)
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            summary = None
+            # bhsd -> bshd -> bsH
+            attn_out = bhsd_to_bsH(attn_out)
+        
+        return TorchTensor.create_from_torch(attn_out, self), \
+            TorchTensor.create_from_torch(k, self), \
+                TorchTensor.create_from_torch(v, self), \
+                    summary
 
+    def qkv_proj_decode(self, 
+                        h, attn_mask, position_embed, 
+                        w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
+                        tail_k, tail_v, k_summary,
+                        n_head, context_len, enable_sparse=False, block_size=None):
+        """ k_summary: (b, h, blk, d)"""
+        head_dim = h.shape[-1]
+        cos = position_embed.data[0][context_len-1:context_len]
+        sin = position_embed.data[1][context_len-1:context_len]
+
+        mask = None if attn_mask is None else attn_mask.data
+        q, k, v = self._qkv_proj(h.data, mask, (cos, sin), 
+                                 w_q.data, b_q.data, w_k.data, b_k.data, w_v.data, b_v.data, w_ln.data,
+                                 n_head)
+        # get idx
+        if enable_sparse:
+            if k_summary is None:
+                tail_len = tail_length(context_len, block_size)
+                assert tail_k.data.shape[2] == context_len-tail_len
+                b, n_kvhead, s, head_dim = tail_k.data.shape
+                assert s % block_size == 0
+                # (b, head, s, d) -> (b, head, nblk, blk, d)
+                summary = tail_k.data.reshape(b, n_kvhead, -1, block_size, head_dim) \
+                                        .mean(dim=-2, keepdim=False)
+                
+                summary_ret = TorchTensor.create_from_torch(summary, self)
+
+            elif context_len % block_size == 0:
+                tail_len = tail_length(context_len, block_size)
+                last_block = torch.concat([tail_k.data, k], dim=2)
+
+                print(f" >>> shape of k: {k.shape}")
+                print(f" >>> shape of tail_k.data: {tail_k.data.shape}")
+                assert last_block.shape[2] == block_size, \
+                    f" !!!block-size:{last_block.shape[2]}, context-len:{context_len}"
+
+                new_summary = last_block.mean(dim=2, keepdim=True)
+                summary = torch.concat([k_summary.data, new_summary], dim=2)
+                summary_ret = TorchTensor.create_from_torch(new_summary, self)
+            else:
+                summary = k_summary.data
+                summary_ret = None  # no summary update 
+
+            b, n_kvhead, num_blk, head_dim = summary.shape
+
+            blk_attn_score = self._gqa_attn_weights(q, summary, mask=None)
+
+            topk = max(num_blk//5, 1)
+            # (b, h, k)
+            top_weight, top_idx = torch.topk(blk_attn_score, num_blk // 5, dim=-1, sorted=False)
+            idx = expand_block_idx(top_idx, block_size)
+            print(f" >>> idx content:{ idx.flatten()[:5]}")
+            idx = TorchTensor.create_from_torch(idx, self)
             
-        return TorchTensor.create_from_torch(new_k_summary, self), TorchTensor.create_from_torch(new_v_summary, self)
-        
+        else:
+            attn_output = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+            
 
-    def select_tokens(self, q, k_summary, n_head, block_size):
-        """ 
-        q:(b, head, s, d), 
-        summary in shape (b, head, s, d)
-        return: idx(b, head, s, k)"""
-        b, _, s_tgt, d = q.shape
-        n_qhead, n_kvhead = n_head
-        
-        k_summary = k_summary.data
-        n_block = k_summary.shape[2]
-        selected_block = max(int(n_block * 0.2), 1)
+            idx = None
+            summary_ret = None
 
-        # (b, head, s_tgt, blk)
-        importance = torch.matmul( q.data, k_summary)
-
-        topk_weights, topk_idx = torch.topk(importance, k=n_block, dim=-1, sorted=False)
-        
-        idx = expand_block_idx(topk_idx, block_size=block_size)
-
-        return TorchTensor.create_from_torch(idx, self)
+        return  TorchTensor.create_from_torch(q, self), \
+                TorchTensor.create_from_torch(k, self),  \
+                TorchTensor.create_from_torch(v, self), \
+                summary_ret, idx
 
        
-    def kv_summary(self, k:TorchTensor, v:TorchTensor, block_size):
-        """ k, v: (s, b*h, d) """
+    def _summary(self, k, block_size, new_k=None, block_range=None):
+        """ k, v: (s, b*h, d) 
+            return torch.Tensor"""
         k = k.data
-        v = v.data
+
+        if new_k is not None:
+            k = torch.concat([k, new_k.data], dim=2)
+
+            assert len(k.shape) == 4
+            assert k.shape[2] % block_size == 0, f"invalid summary time when tail-len={k.shape[2]}"
+            
 
         b, n_kvhead, s, head_dim = k.shape
+        if block_range is not None:
+            s = min(s, block_range)
 
         num_block = s // block_size
-        k_shape = k.shape
         k = k[:num_block*block_size]
-        v = v[:num_block*block_size]
 
         cache_shape = k.shape
         k = k.view(num_block, block_size, *cache_shape)
-        v = v.view(num_block, block_size, *cache_shape)
         
         k = k.mean(dim=1)
-        v = v.mean(dim=1)
         
-        return TorchTensor.create_from_torch(k, self), TorchTensor.create_from_torch(v, self)
+        return k
 
-    def gqa_after_proj(self, q, k, v, w_o, tail_k, tail_v):
+    def gqa_after_proj(self, q, k, v, 
+                       w_o, 
+                       tail_k, tail_v, k_cache, v_cache):
         """ q:      (b, head, s, d)
             kv:     (s, b*head, d)
             ret:    (b,head, s, d)
         """
-        q = q.data
         b, n_qhead, s, head_dim = q.shape
+        n_kvhead = tail_k.shape[1]
+        
+        q, k,v = q.data, k.data, v.data
 
         # (b, head, s, d)
-        k = torch.concat([k.data, tail_k.data], dim=2)
-        v = torch.concat([v.data, tail_v.data], dim=2)
-
+        concated_k = []
+        concated_v = []
+        if k_cache is not None:
+            k_cache = k_cache.data
+            v_cache = v_cache.data
+            if k_cache.shape[-2] != n_qhead:
+                k_cache = repeat_interleave(k_cache, n_qhead, n_kvhead)
+                v_cache = repeat_interleave(v_cache, n_qhead, n_kvhead)
+            concated_k.append(k_cache)
+            concated_v.append(v_cache)
+            
+        if tail_k is not None:
+            tail_k = torch.repeat_interleave(tail_k.data, n_qhead//n_kvhead, dim=1)
+            tail_v = torch.repeat_interleave(tail_v.data, n_qhead//n_kvhead, dim=1)
+            concated_k.append(tail_k)
+            concated_v.append(tail_v)
+        
+        concated_k.append(k)
+        concated_v.append(v)
+        
+        k = torch.concat(concated_k, dim=-2)
+        v = torch.concat(concated_v, dim=-2)
+                
         # (b, head, s, d)
         attn_output = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
         # 
@@ -999,7 +1148,7 @@ class TorchDevice:
         """
         # b, n_qhead, tgt_s, head_dim = q.shape
         # _, n_kvhead, src_s, _ = k.shape[2]
-        b, n_qhead, n_kvhead, tgt_s, src_s, head_dim = derive_shapes(q, k, mask)
+        b, n_qhead, n_kvhead, tgt_s, src_s, head_dim = derive_shapes(q, k)
         
         k1 = k.repeat_interleave(n_qhead//n_kvhead, dim=1)
         
@@ -1437,8 +1586,8 @@ class TorchLink:
         return size / bandwidth
 
 
-def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
-                 src: TorchTensor, src_indices: Tuple[slice]):
+def general_copy(dst: TorchTensor, dst_indices: Tuple,
+                 src: TorchTensor, src_indices: Tuple):
     """Launch a general asynchronous copy between two tensors.
     It is equivalent to `dst[dst_indices] = src[src_indices]` in numpy syntax.
     The copy is asynchronous. To wait for the copy to complete, you need to call
@@ -1493,21 +1642,15 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
           dst.device.device_type == DeviceType.CUDA and
           not src.data.is_pinned()):
         # The cpu tensor is not pinned, use pin_memory as a relay
-        src = src.data[src_indices] if src_indices else src.data
-        dst = dst.data[dst_indices] if dst_indices else dst.data
+        src = index_into(src.data, src_indices) if src_indices is not None else src.data
+        dst = index_into(dst.data, dst_indices) if dst_indices is not None else dst.data
         src = src.pin_memory()
         dst.copy_(src, non_blocking=True)
     else:
         # The normal path
-        if isinstance(src_indices, torch.Tensor):
-            # case of block sparse
-            head_dim = src.data.shape[-1]
-            sec = src.data.gather(dim=-2, 
-                            index=src_indices.unsqueeze(-1).expand(-1,-1,-1,head_dim))
-        else:
-            src = src.data[src_indices] if src_indices is not None else src.data
+        src = index_into(src.data, src_indices) if src_indices is not None else src.data
 
-        dst = dst.data[dst_indices] if dst_indices is not None else dst.data
+        dst = index_into(dst.data, dst_indices) if dst_indices is not None else dst.data
 
         dst.copy_(src, non_blocking=True)
 

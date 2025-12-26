@@ -169,9 +169,7 @@ def torch_mem_stats():
         element_size = tensor.storage().element_size()
         mem = numel * element_size
         total_mem += mem
-
     return total_mem
-
 
 class ValueHolder:
     def __init__(self):
@@ -314,7 +312,7 @@ def expand_block_idx(block_idx, block_size, return_form="BHN"):
     topk = block_idx.shape[-1]
 
     block_starts = block_idx * block_size
-    intra_block_idx = torch.arange(block_size)
+    intra_block_idx = torch.arange(block_size, device=block_idx.device)
 
     expanded = block_starts.unsqueeze(-1) + intra_block_idx
     expanded = expanded.flatten(-2)
@@ -325,5 +323,18 @@ def expand_block_idx(block_idx, block_size, return_form="BHN"):
     # elif return_form == "idx":
 
 
+def num_block(context_len, block_size):
+    return context_len // block_size - 1
 
-        
+def bhsd_to_cache_shape(cache):
+    b, h, s, d = cache.shape
+    c = cache.permute(2, 0, 1, 3).reshape(s, b*h, d)
+    return c
+
+def tail_length(s, block_size):
+    return s % block_size + block_size
+
+def bhsd_to_bsH(t:torch.Tensor):
+    b, h, s, d = t.shape
+    r = t.permute(0, 2, 1, 3).reshape(b, s, h*d)
+    return r
