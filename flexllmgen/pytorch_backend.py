@@ -55,6 +55,11 @@ def repeat_interleave(kv_data, n_qhead, n_kvhead):
     assert len(kv_data.shape) == 4
     return torch.repeat_interleave(kv_data, n_qhead//n_kvhead, dim=1)
 
+def check_idx(idx):
+    mx = idx.max()
+    mn = idx.min()
+    assert mx < 1000000 and mn >= 0
+
 def fix_recursive_import():
     global general_copy_compressed, TorchCompressedDevice, global_cpu_device
     from flexllmgen import compression
@@ -80,7 +85,6 @@ def extract_cache_to_bhsd(cache, b, n_head, s, d):
     return cache.data[:s].view(s, b, n_head, d).permute(1,2,0,3)
   
     # k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
-
 
 def select_topk(v:torch.Tensor, indices:torch.Tensor):
     """
@@ -471,6 +475,9 @@ class TorchDevice:
         k_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
         v_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
 
+        if policy.sparse_config.mode != "block":
+            return k_cache, v_cache
+
         # the s%block_sz tokens must be indiced
         block_size = policy.sparse_config.block_size 
         num_block = (prompt_len + gen_len) // block_size + block_size
@@ -576,12 +583,12 @@ class TorchDevice:
             # (b, h, s, k)
             attn_weight = torch.softmax(sparse_attn_score, dim=-1)
 
-            print(f" >>> n-sample-kv:{n_sample_kv}")
+            # print(f" >>> n-sample-kv:{n_sample_kv}")
 
             # (b, h, s, k) * (b, h, k, d) -> (b, h, s, d)
             v1 = repeat_interleave(v[:, :, -n_sample_kv:], n_qhead, n_kvhead)
 
-            print(f" >>> shape of attn_weight: {attn_weight.shape}")
+            # print(f" >>> shape of attn_weight: {attn_weight.shape}")
             attn_out = torch.matmul(attn_weight, v1)
 
             attn_out = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
@@ -590,7 +597,7 @@ class TorchDevice:
             n_blk = num_block(s, block_size)
             summary = k[:,:,:-tail_len].reshape(b, n_kvhead, n_blk, block_size, head_dim).mean(dim=-2)
 
-            print(f" >>> shape of summary: {summary.shape}")
+            # print(f" >>> shape of summary: {summary.shape}")
             
             summary = TorchTensor.create_from_torch(summary, self)
 
@@ -620,7 +627,13 @@ class TorchDevice:
                                  w_q.data, b_q.data, w_k.data, b_k.data, w_v.data, b_v.data, w_ln.data,
                                  n_head)
         # get idx
-        if enable_sparse:
+        if not enable_sparse:
+            # use q for return value 
+            q = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+            
+            idx = None
+            summary_ret = None
+        else:
             if k_summary is None:
                 tail_len = tail_length(context_len, block_size)
                 assert tail_k.data.shape[2] == context_len-tail_len
@@ -636,8 +649,8 @@ class TorchDevice:
                 tail_len = tail_length(context_len, block_size)
                 last_block = torch.concat([tail_k.data, k], dim=2)
 
-                print(f" >>> shape of k: {k.shape}")
-                print(f" >>> shape of tail_k.data: {tail_k.data.shape}")
+                # print(f" >>> shape of k: {k.shape}")
+                # print(f" >>> shape of tail_k.data: {tail_k.data.shape}")
                 assert last_block.shape[2] == block_size, \
                     f" !!!block-size:{last_block.shape[2]}, context-len:{context_len}"
 
@@ -656,15 +669,8 @@ class TorchDevice:
             # (b, h, k)
             top_weight, top_idx = torch.topk(blk_attn_score, num_blk // 5, dim=-1, sorted=False)
             idx = expand_block_idx(top_idx, block_size)
-            print(f" >>> idx content:{ idx.flatten()[:5]}")
+            check_idx(idx)
             idx = TorchTensor.create_from_torch(idx, self)
-            
-        else:
-            attn_output = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
-            
-
-            idx = None
-            summary_ret = None
 
         return  TorchTensor.create_from_torch(q, self), \
                 TorchTensor.create_from_torch(k, self),  \

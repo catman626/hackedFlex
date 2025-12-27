@@ -267,16 +267,6 @@ class SelfAttention:
 
         return selected_idx
 
-    def load_selected_block(self, cache_home, cache_read_buf, i):
-        k_home, v_home, block_cache, idx_cache = cache_home.val
-
-        selected_idx = self.caculate_selected_token_ids( idx_cache.val)
-
-        cache_read_buf.store((
-            k_home.smart_copy(dst, (selected_idx, )),
-            v_home.smart_copy(dst, (selected_idx, )),
-        ))
-
     def load_summary(self, cache_home, cache_read_buf, i):
         k_cache, v_cache, block_cache, idx_cache = cache_home.val
         cache_read_buf.store((
@@ -285,10 +275,6 @@ class SelfAttention:
 
     def load_cache(self, cache_home, cache_read_buf, i):
         if i == 0:  # prefill, no cache
-            return
-        
-        if self.policy.sparse_config.mode == "block":
-            self.load_cache_block_sparse(cache_home, cache_read_buf, i)
             return
         
         k_home, v_home = cache_home.val
@@ -358,7 +344,6 @@ class SelfAttention:
         # shape: (s, b * n_head, head_dim)
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
-        
 
         if i == self.task.gen_len - 1:  # last token, no need to store cache
             return
@@ -1355,7 +1340,8 @@ class QwenLM:
             self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
 
     def delete_cache(self, j, k):
-        self.layers[j].delete_cache(self.cache_home[j][k])
+        if self.policy.sparse_config.mode == "block":
+            self.layers[j].delete_cache(self.cache_home[j][k])
 
     def move_hidden(self, i, j, k):
         self.store_hidden(i, j-1, k)
@@ -1578,17 +1564,20 @@ class QwenLM:
         for j in range(num_layers):
             for k in range(num_gpu_batches):
                 self.init_cache(j, k)
-        for j in range(num_layers):
-            for k in range(num_gpu_batches):
-                self.link_cache(j, k)
-        self.check_cache()
+        if self.policy.sparse_config.mode == "block":
+            for j in range(num_layers):
+                for k in range(num_gpu_batches):
+                    self.link_cache(j, k)
+            self.check_cache()
             
         if self.policy.cpu_cache_compute:
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
 
         # Generate
         if debug_mode is None:
-            if not overlap:
+            if self.policy.sparse_config.mode == "block":
+                self.generation_loop_block_sparse()
+            elif not overlap:
                 # No overlap, easy to understand, suitable for debugging
                 self.generation_loop_normal()
             else:
@@ -1651,6 +1640,7 @@ class QwenLM:
 
         # Generate
         for i in range(self.execute_gen_len):
+            print(f" >>> step-{i}") 
             timers("generate").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
