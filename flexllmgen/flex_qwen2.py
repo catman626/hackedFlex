@@ -16,7 +16,7 @@ from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, Torch
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
-    read_benchmark_log, expand_block_idx, num_block, tail_length)
+    read_benchmark_log, expand_block_idx, num_block, tail_length, cache_slice)
 from flexllmgen.qwen2_config import QwenConfig, get_qwen_config, convert_qwen_weights
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.sparse import SparseConfig
@@ -551,10 +551,11 @@ class QKVProj(TransformerComponent):
                     place_holder)
             )
         else:
-            if i == 0 or not self._sparse_stage(i-1):
+            if not self._sparse_stage(i-1):
                 # load all kv to compute summary
+                tail_len = tail_length(context_len, block_size)
                 cache_read_buf.store( 
-                    (   k_home.smart_copy(dst, (slice(None), slice(None), slice(0, context_len-1))), 
+                    (   k_home.smart_copy(dst, cache_slice(0, context_len-tail_len)), 
                         place_holder, 
                         place_holder, 
                         idx_home ))
@@ -564,8 +565,7 @@ class QKVProj(TransformerComponent):
 
                 summary_idx = (slice(None), slice(None), slice(0, n_blk))
                 if context_len % block_size == 0:
-                    tail_k_idx = (  slice(None), slice(None), 
-                                    slice(context_len-tail_len, context_len-1)    )
+                    tail_k_idx = cache_slice(context_len-tail_len, context_len-1)    
                     cache_read_buf.store(
                         (   k_home.smart_copy(dst, tail_k_idx),
                             place_holder,
@@ -780,7 +780,7 @@ class AttentionAfterProj(TransformerComponent):
         else:
             ( (w_o, _       ),  ) = weight_read_buf.val
 
-        if i == 0:
+        if i == 0 :
             q = hidden.val
             h = self.compute.out_proj(q, w_o)
         else:

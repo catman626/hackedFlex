@@ -515,7 +515,6 @@ class TorchDevice:
         h = F.linear(h.data, w_o.data)
 
         return TorchTensor.create_from_torch(h, self)
-        
 
     def _qkv_proj(self, h, 
                  attn_mask, position_embed, 
@@ -578,7 +577,6 @@ class TorchDevice:
             k1 = torch.repeat_interleave(k, n_qhead//n_kvhead, dim=1)
             attn_score = torch.matmul(last_q, k1.transpose(2, 3))
             n_sample_kv = s//10
-            
 
             q = q * (head_dim ** -0.5)
             sparse_attn_score = torch.matmul(q, k1[:,:,-n_sample_kv:].transpose(2,3)    ) 
@@ -593,7 +591,7 @@ class TorchDevice:
 
             attn_out = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
 
-            tail_len = s % block_size + block_size
+            tail_len = tail_length(s, block_size)
             n_blk = num_block(s, block_size)
             summary = k[:,:,:-tail_len].reshape(b, n_kvhead, n_blk, block_size, head_dim).mean(dim=-2)
             
@@ -621,14 +619,15 @@ class TorchDevice:
         # get idx
         if not enable_sparse:
             # use q for return value 
-            q = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+            # q = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+            # q = bhsd_to_bsH(q)
             
             idx = None
             summary_ret = None
         else:
             if k_summary is None:
                 tail_len = tail_length(context_len, block_size)
-                assert tail_k.data.shape[2] == context_len-tail_len
+                assert tail_k.shape[2] == context_len-tail_len, f" !!! tail_k.shape:{tail_k.shape}, context-len:{context_len}"
                 b, n_kvhead, s, head_dim = tail_k.data.shape
                 assert s % block_size == 0
                 # (b, head, s, d) -> (b, head, nblk, blk, d)
@@ -702,7 +701,7 @@ class TorchDevice:
             ret:    (b,head, s, d)
         """
         b, n_qhead, s, head_dim = q.shape
-        n_kvhead = tail_k.shape[1]
+        n_kvhead = new_k.shape[1]
         
         q, new_k,new_v = q.data, new_k.data, new_v.data
 
