@@ -326,10 +326,12 @@ def expand_block_idx(block_idx, block_size, return_form="BHN"):
 def num_block(context_len, block_size):
     return context_len // block_size - 1
 
-def bhsd_to_cache_shape(cache):
-    b, h, s, d = cache.shape
-    c = cache.permute(2, 0, 1, 3).reshape(s, b*h, d)
-    return c
+def to_cache_home_shape(cache):
+    # if extend needed, uncomment
+
+    # b, h, s, d = cache.shape
+    # cache = cache.permute(2, 0, 1, 3).reshape(s, b*h, d)
+    return cache
 
 def tail_length(s, block_size):
     return s % block_size + block_size

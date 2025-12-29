@@ -16,15 +16,15 @@ from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, Torch
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
-    read_benchmark_log, expand_block_idx, num_block, tail_length)
+    read_benchmark_log)
 from flexllmgen.qwen2_config import QwenConfig, get_qwen_config, convert_qwen_weights
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.sparse import SparseConfig
 
+
 from flexllmgen.flex_opt import init_weight_list, get_compact_test_inputs, get_file_inputs, get_test_inputs, get_filename
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
-
 
 @dataclasses.dataclass(frozen=True)
 class Policy:
@@ -74,6 +74,7 @@ class Policy:
     def act_disk_percent(self):
         return 100 - self.act_gpu_percent - self.act_cpu_percent
 
+
 def get_choice(cur_percent, percents, choices):
     percents = np.cumsum(percents)
     assert np.abs(percents[-1] - 100) < 1e-5
@@ -82,6 +83,7 @@ def get_choice(cur_percent, percents, choices):
         if cur_percent < percents[i]:
             return choices[i]
     return choices[-1]
+
 
 def init_weight_list(weight_specs, policy, env):
     dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
@@ -144,37 +146,6 @@ def eager_attention_core(q, k, v , seq_len, head_dim, device):
 
     return attn_output
 
-class TransformerComponent:
-    def __init__(self, config, env, policy, layer_id) -> None:
-        self.config = config
-        self.env = env
-        self.policy = policy
-        self.layer_id = layer_id
-        self.task:Task|None = None
-    
-    def set_task(self, task)->None:
-        self.task = task
-
-    def _context_len(self, i, after_proj=True) -> int:
-        return self.task.prompt_len + i
-
-    def _sparse_stage(self, i):
-        return self._context_len(i) >= 2048+self.policy.sparse_config.block_size
-
-    def store_cache(self, cache_home, cache_write_buf, i):
-        """ this part only use cache, no store """
-        pass 
-
-    def delete_cache(self, cache_home):
-        pass
-
-    def init_cache_one_gpu_batch(self, cache_home):
-        pass  # do nothing
-
-    def load_cache(self, cache_home, cache_read_buf, i):
-        pass  # do nothing
-
-
 class SelfAttention:
     def __init__(self, config, env, policy, layer_id):
         self.config = config
@@ -187,9 +158,9 @@ class SelfAttention:
         self.attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
             else self.env.gpu)
 
-        self.task:Task|None = None
+        self.task = None
 
-    def set_task(self, task)->None:
+    def set_task(self, task):
         self.task = task
 
     def init_weight(self, weight_home, path):
@@ -214,8 +185,12 @@ class SelfAttention:
             ((kv_dim,), dtype, attn_path + ".v_proj.bias"),
             # w_out
             ((h, h), dtype, attn_path + ".o_proj.weight"),
+            # b_out, o_proj have no bias in qwen2
+            # ((h,), dtype, path + ".out_proj.bias"),
             # w_ln
             ((h,), dtype, layer_path + ".input_layernorm.weight"),
+            # # b_ln, rms has no bias
+            # ((h,), dtype, path + "_layer_norm.bias"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
@@ -231,6 +206,12 @@ class SelfAttention:
                 w_v.smart_copy(dst1), b_v.smart_copy(dst2),
                 w_out.smart_copy(dst1), 
                 w_ln.smart_copy(dst2)))
+            # weight_read_buf.store((
+            #     w_q.smart_copy(dst1), b_q.smart_copy(dst2),
+            #     w_k.smart_copy(dst1), b_k.smart_copy(dst2),
+            #     w_v.smart_copy(dst1), b_v.smart_copy(dst2),
+            #     w_out.smart_copy(dst1), b_out.smart_copy(dst2),
+            #     w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         if self.policy.cache_gpu_percent == 100:
@@ -249,35 +230,10 @@ class SelfAttention:
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
         cache_home.store(cache)
 
-    def calculate_selected_token_ids(self, block_idx):
-        """ return (b, qhead, topk) """
-        block_idx = block_idx.val   # (b, head, topk)
-        block_size = self.policy.sparse_config.block_size
-        b, n_qhead, topk = block_idx.shape
-        src_s = self.task.prompt_len + i
-        tail_len = src_s % block_size
-        if tail_len > 0:
-            st = (src_s // block_size) * block_size
-            tails = torch.arange(st, st+tail_len)   # (ntail,)
-            
-        expanded_block = expand_block_idx(block_idx, self.policy.sparse_config.block_size)
-        selected_idx = torch.concat(
-                [expanded_block, tails.expand(b, n_qhead, tail_len)],  
-                dim=-1 )
-
-        return selected_idx
-
-    def load_summary(self, cache_home, cache_read_buf, i):
-        k_cache, v_cache, block_cache, idx_cache = cache_home.val
-        cache_read_buf.store((
-            block_cache.smart_copy(dst),
-        )) 
-
     def load_cache(self, cache_home, cache_read_buf, i):
-        # self-load-cache
         if i == 0:  # prefill, no cache
             return
-        
+
         k_home, v_home = cache_home.val
 
         # Pick code path
@@ -297,9 +253,8 @@ class SelfAttention:
 
         if path == 0:  # Direct copy
             # shape: (s, b * n_head, head_dim)
-            # indices = (slice(0, self.task.prompt_len + i),
-            #            slice(0, k_home.shape[1]))
-            indices = (slice(None), slice(None), slice(0, self.task.prompt_len + i))
+            indices = (slice(0, self.task.prompt_len + i),
+                       slice(0, k_home.shape[1]))
 
             if self.policy.sparse_config.mode == "dense":
                 cache_read_buf.store((
@@ -343,63 +298,37 @@ class SelfAttention:
             raise ValueError(f"Invalid path: {path}")
 
     def store_cache(self, cache_home, cache_write_buf, i):
-        # self-store-cache
         # shape: (s, b * n_head, head_dim)
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
+        
 
         if i == self.task.gen_len - 1:  # last token, no need to store cache
             return
 
         if i == 0:  # prefill
-            indices = (slice(None), slice(None), slice(0, k_new.shape[2]))
-            # indices = (slice(0, k_new.shape[0]),
-            #            slice(0, k_new.shape[1]))
+            indices = (slice(0, k_new.shape[0]),
+                       slice(0, k_new.shape[1]))
         else:  # decoding
             pos = self.task.prompt_len + i
-            # indices = (slice(pos - k_new.shape[0], pos),
-            #            slice(0, k_new.shape[1]))
-            indices = (slice(None), slice(None), slice(pos - k_new.shape[2], pos))
-        
+            indices = (slice(pos - k_new.shape[0], pos),
+                       slice(0, k_new.shape[1]))
+
+        print(f" >>> shape of k_new: {k_new.shape}")
+        print(f" >>> shape of k_home: {k_home.shape}")
 
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
 
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
-    
-    def forward_qkvproj(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                position_embeddings, cache_write_buf, i, k):
-        donate = [False] * (1+1+1+7)
-        # 0:hidden, 1:mask, 2:pos_embd, 345678 qkv_wb, 9 w_ln
-        
-        h, donate[0] = hidden.val, True
-        
-        n_qhead = self.config.num_attention_heads
-        n_kvhead = self.config.num_key_value_heads
-
-        if k == self.policy.num_gpu_batches - 1:
-            (( w_q,  donate[3]), (b_q, donate[4]), 
-            (  w_k, donate[5]), (b_k, donate[6]),
-            (  w_v, donate[7]), (b_v, donate[8]),
-            (  w_ln, donate[9])) = weight_read_buf.val.pop()
-        else:
-            # (w, _),  = weight_read_buf.val
-            ( (w_q, _), (b_q, _), (w_k, _), (b_k, _), (w_v, _), (b_v, _), (w_ln, _) ) = weight_read_buf.val
-
-        position_embed, donate[2] = position_embeddings.val.smart_copy(self.compute)
-        q, k, v= self.compute.qkv_proj(h, w_q, b_q, w_k, b_k, w_v, b_v, position_embeddings)
-        K_summary, v_summary = self.compute.kv_summary(k, v)
-        cache_write_buf.store((k, v, k_summary, v_summary))
-
-        hidden.val = q
-
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 position_embeddings, cache_write_buf, i, k):
-        # forward-attn
+        # n_head = self.config.n_head
         n_qhead = self.config.num_attention_heads
         n_kvhead = self.config.num_key_value_heads
+
 
         donate = [False] * 14   # keep 14, but idx for b_out will not be used
         # 0:hidden, 1:mask, 2-11:weight, 12:kcache, 13:vcache
@@ -425,7 +354,7 @@ class SelfAttention:
             cache_write_buf.store((new_k_cache, new_v_cache))
 
             dump_hidden(h.data,  "attn-output", self.layer_id)
-
+            # torch.save(h.data, f"my/layer-{self.layer_id}-attn-output")
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             position_embed, donate[2] = position_embeddings.val.smart_copy(self.compute)
@@ -435,264 +364,25 @@ class SelfAttention:
                 mask, position_embed, 
                 w_q, b_q, w_k, b_k, w_v, b_v, w_out, w_ln, 
                 (n_qhead, n_kvhead),
-                k_cache, v_cache, 
+                k_cache, 
+                v_cache, 
                 donate, 
-                self.policy.sparse_config, self.policy.compress_cache, self.policy.comp_cache_config,
+                self.policy.sparse_config,
+                self.policy.compress_cache, 
+                self.policy.comp_cache_config,
                 self.layer_id)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h
 
-class QKVProj(TransformerComponent):
+
+class MLP:
     def __init__(self, config, env, policy, layer_id):
-        self.config : QwenConfig = config
+        self.config = config
         self.env = env
         self.layer_id = layer_id
         self.policy = policy
-        self.compute:TorchDevice= self.env.gpu
-        self.attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
-            else self.env.gpu)
-        self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
-            else self.compute)
-        self.task:Task|None= None
-
-    def init_weight(self, weight_home, path):
-        h, dtype = (self.config.hidden_size, self.config.dtype)
-        head_dim = h // self.config.num_attention_heads
-        kv_dim = head_dim * self.config.num_key_value_heads
-        layer_path = os.path.join(path, f"layers.{self.layer_id}")
-        attn_path = layer_path + ".self_attn"
-
-        weight_specs = [
-            # w_q
-            ((h, h), dtype, attn_path + ".q_proj.weight"),
-            # b_q
-            ((h,), dtype, attn_path + ".q_proj.bias"),
-            # w_k
-            ((kv_dim, h), dtype, attn_path + ".k_proj.weight"),
-            # b_k
-            ((kv_dim,), dtype, attn_path + ".k_proj.bias"),
-            # w_v
-            ((kv_dim, h), dtype, attn_path + ".v_proj.weight"),
-            # b_v
-            ((kv_dim,), dtype, attn_path + ".v_proj.bias"),
-            # w_ln
-            ((h,), dtype, layer_path + ".input_layernorm.weight"),
-        ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
-        weight_home.store(weights)
-
-
-    def load_weight(self, weight_home, weight_read_buf, k):
-        if k == 0:
-            w_q, b_q, w_k, b_k, w_v, b_v, w_ln = weight_home.val
-            dst1 = self.weight_load_dst
-            dst2 = self.compute
-            weight_read_buf.store(
-                ( w_q.smart_copy(dst1), b_q.smart_copy(dst2),
-                w_k.smart_copy(dst1), b_k.smart_copy(dst2),
-                w_v.smart_copy(dst1), b_v.smart_copy(dst2),
-                w_ln.smart_copy(dst2) )
-            )
-
-    def delete_cache(self, cache_home):
-        k_home, v_home, k_summary_home, (idx_home, idx_num) = cache_home.val
-        k_home.delete()
-        v_home.delete()
-        k_summary_home.delete()
-        idx_home.delete()
-        idx_num.clear()
-        
-    def init_cache_one_gpu_batch(self, cache_home):
-        if self.policy.cache_gpu_percent == 100:
-            device = self.env.gpu
-        elif self.policy.cache_cpu_percent == 100:
-            device = self.env.cpu
-        elif self.policy.cache_disk_percent == 100:
-            device = self.env.disk
-        else:
-            device = self.env.mixed
-
-        if self.policy.compress_cache:
-            assert device.device_type != DeviceType.MIXED
-            device = device.compressed_device
-
-        cache = device.init_cache_one_gpu_batch_qwen(self.config, self.task, self.policy)
-        cache_home.store(cache)
-
-
-    def load_summary(self, cache_home, cache_read_buf, i):
-        k_cache, v_cache, block_cache, idx_cache = cache_home.val
-        cache_read_buf.store(
-            ( block_cache.smart_copy(self.attention_compute), )
-        ) 
-
-    def load_cache(self, cache_home, cache_read_buf, i):
-        """ proj-load-cache"""
-        if i == 0:
-            # prefill
-            return
-        
-        # print(f" >>> step {i} layer {self.layer_id} proj load cache: {id(cache_home)}")
-        k_home, v_home, summary_home, idx_home = cache_home.val
-
-        context_len = self._context_len(i)
-        block_size = self.policy.sparse_config.block_size
-
-        dst = self.attention_compute
-        place_holder = (None, True)
-
-        if not self._sparse_stage(i):
-            indices = (slice(None), slice(None), slice(0, context_len))
-            cache_read_buf.store(
-                (   k_home.smart_copy(dst, indices), 
-                    v_home.smart_copy(dst, indices), 
-                    place_holder, 
-                    place_holder)
-            )
-        else:
-            if i == 0 or not self._sparse_stage(i-1):
-                # load all kv to compute summary
-                cache_read_buf.store( 
-                    (   k_home.smart_copy(dst, (slice(None), slice(None), slice(0, context_len-1))), 
-                        place_holder, 
-                        place_holder, 
-                        idx_home ))
-            else:
-                tail_len = tail_length(context_len, block_size)
-                n_blk = num_block(context_len, block_size)
-
-                summary_idx = (slice(None), slice(None), slice(0, n_blk))
-                if context_len % block_size == 0:
-                    tail_k_idx = (  slice(None), slice(None), 
-                                    slice(context_len-tail_len, context_len-1)    )
-                    cache_read_buf.store(
-                        (   k_home.smart_copy(dst, tail_k_idx),
-                            place_holder,
-                            summary_home.smart_copy(dst, summary_idx),
-                            idx_home        )
-                    )
-                else:
-                    cache_read_buf.store(
-                        (   place_holder, place_holder, 
-                            summary_home.smart_copy(dst, summary_idx),
-                            idx_home    )
-                    )
-
-    def store_cache(self, cache_home, cache_write_buf, i):
-        """proj-store-cache"""
-        # shape: (s, b * n_head, head_dim)
-        # current impl load&store whole summary
-        # print(f" >>> step-{i} layer-{self.layer_id} proj-store-cache: {id(cache_home)}")
-        k_home, v_home, k_summary_home, idx= cache_home.val
-        k_new, v_new, k_summary = cache_write_buf.pop()
-        
-        # if i == self.task.gen_len - 1:  # last token, no need to store cache
-        #     return
-
-        # store k,v
-        if i == 0:  # prefill
-            # knew: (b, h, s, d)
-            indices = (slice(None), slice(None), slice(0, k_new.shape[2]),slice(None))
-        else:  # decoding
-            pos = self.task.prompt_len + i
-            indices = (slice(None), slice(None), slice(pos - k_new.shape[0], pos), slice(None))
-        general_copy(k_home, indices, k_new, None)
-        general_copy(v_home, indices, v_new, None)
-
-        # store summary
-        if k_summary is not None:
-            context_len = self._context_len(i)
-            
-            block_size = self.policy.sparse_config.block_size
-            num_blk = context_len // block_size - 1
-
-            # print(f" >>> context_len: {self._context_len(i)}")
-            # print(f" >>> summary shape: {k_summary.shape}") 
-            if i == 0 or not self._sparse_stage(i-1):
-                assert num_blk == k_summary.shape[2]
-                dst_idx = slice(0, num_blk)
-            else:
-                dst_idx = slice(num_blk-1, num_blk)
-            general_copy(k_summary_home, (  slice(None),
-                                            slice(None), 
-                                            dst_idx ), 
-                         k_summary, 
-                         None)
-        # store idx
-        
-
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                position_embeddings, cache_write_buf, i, k):
-        """ proj-forward """
-        # print(f" >>> step-{i},layer-{self.layer_id},batch-{k} proj-forward")
-        donate = [False] * (1+1+1+7+2)
-        # 0:hidden, 1:mask, 2:pos_embd, 345678 qkv_wb, 9 w_ln, 10-11 tail_kv
-        
-        h, donate[0] = hidden.val, True
-        
-        n_qhead = self.config.num_attention_heads
-        n_kvhead = self.config.num_key_value_heads
-
-        if k == self.policy.num_gpu_batches - 1:
-            (( w_q,  donate[3]), (b_q, donate[4]), 
-            (  w_k, donate[5]), (b_k, donate[6]),
-            (  w_v, donate[7]), (b_v, donate[8]),
-            (  w_ln, donate[9])) = weight_read_buf.pop()
-        else:
-            (   (w_q, _), (b_q, _), 
-                (w_k, _), (b_k, _), 
-                (w_v, _), (b_v, _), 
-                (w_ln, _) ) = weight_read_buf.val
-
-        position_embed, donate[2] = position_embeddings.val.smart_copy(self.compute)
-        
-        # TODO handle attn-mask
-        context_len = self._context_len(i)
-        block_size = self.policy.sparse_config.block_size
-
-        if i == 0:
-            q, k, v, k_summary = self.compute.qkv_proj_prefill(h, 
-                                                               None, position_embed, 
-                                                               w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
-                                                               (n_qhead, n_kvhead), 
-                                                               enable_sparse=self._sparse_stage(i), 
-                                                               block_size=block_size)
-            cache_write_buf.store((k, v, k_summary))
-            hidden.val = q
-        else:
-            (tail_k, donate[2]), (tail_v, donate[2]), \
-            (summary, donate[2]), (idx_home, idx_cnt)= cache_read_buf.pop()
-            q, k, v, new_summary, idx = self.compute.qkv_proj_decode(
-                h, None, position_embed, 
-                w_q, b_q, w_k, b_k, w_v, b_v, w_ln,
-                tail_k, tail_v, summary, (n_qhead, n_kvhead), context_len, 
-                enable_sparse=self._sparse_stage(i),block_size=block_size)
-            
-            hidden.val = (q, k, v)
-            
-            assert not (self._sparse_stage(i) and idx is None)
-            if idx is not None:
-            # idxhome:(b, head, k) 
-                window_size = idx.data.shape[-1]
-                n_kvhead = self.config.num_attention_heads
-                dst_idx = (slice(None), slice(None), slice(window_size))
-                src_idx = (slice(None), slice(None), 0) 
-                if idx_cnt.val is not None:
-                    idx_cnt.clear()
-                idx_cnt.store(idx.shape[2])
-                general_copy(idx_home, dst_idx, idx, src_idx)
-
-            cache_write_buf.store((k, v, new_summary))
-
-
-class AttentionAfterProj(TransformerComponent):
-    def __init__(self, config, env, policy, layer_id):
-        super().__init__(config, env, policy, layer_id)
-
-        self.compute:TorchDevice= self.env.gpu
-        self.attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
-            else self.env.gpu)
+        self.compute = self.env.gpu
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
             else self.compute)
 
@@ -703,110 +393,9 @@ class AttentionAfterProj(TransformerComponent):
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, self.config.dtype)
-        head_dim = h // self.config.num_attention_heads
-        kv_dim = head_dim * self.config.num_key_value_heads
-        layer_path = os.path.join(path, f"layers.{self.layer_id}")
-        attn_path = layer_path + ".self_attn"
-
-        weight_specs = [
-            # w_out
-            ((h, h), dtype, attn_path + ".o_proj.weight"),
-        ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
-        weight_home.store(weights)
-
-    def load_weight(self, weight_home, weight_read_buf, k):
-        if k == 0:
-            w_out, = weight_home.val
-            dst = self.weight_load_dst
-            weight_read_buf.store(
-                    ( w_out.smart_copy(dst),)
-            )
-
-    def _sparse_stage(self, i):
-        return self._context_len(i) >= 2048+self.policy.sparse_config.block_size
-
-    def load_cache(self, cache_home, cache_read_buf, i):
-        """ attn-load-cache"""
-        if i == 0:  # prefill, no cache
-            return
-        # print(f" >>> step-{i},layer-{self.layer_id} attn-load-cache: {id(cache_home)}")
-        # assert isinstance(cache_home, ValueHolder)
-        k_home, v_home, summary, (idx_home, idx_cnt) = cache_home.val
-        
-        dst = self.attention_compute
-        context_len = self._context_len(i)
-
-        if not self._sparse_stage(i):
-            # load all kv
-            curr_cache_idx = ( slice(None), slice(None), slice(0, context_len))
-            cache_read_buf.store(
-                (   k_home.smart_copy(dst, curr_cache_idx), 
-                    v_home.smart_copy(dst, curr_cache_idx),
-                    (None, True),
-                    (None, True)    )
-            )
-        else:
-            # 1. load blocks    2.load tails
-            assert idx_cnt.val is not None
-            idx_cnt = idx_cnt.pop()
-            
-            idx, _= idx_home.smart_copy(k_home.device)
-            
-            indices = idx.data[:, :, :idx_cnt]
-
-            block_size = self.policy.sparse_config.block_size
-            n_tail_cache =  context_len% block_size + block_size
-
-            # context_len-1 since new_k wont be load
-            tail_idx = (slice(None), slice(None), slice(context_len-n_tail_cache, context_len-1))
-
-            cache_read_buf.store(
-                (   k_home.smart_copy(dst, indices),
-                    v_home.smart_copy(dst, indices),
-                    k_home.smart_copy(dst, tail_idx),
-                    v_home.smart_copy(dst, tail_idx)    )
-            )
-
-    
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-        position_embeddings, cache_write_buf, i, k):
-        """ attn-forward"""
-        # print(f" >>> step-{i},layer-{self.layer_id},batch-{k} attn-forward")
-        donate = [False] * (1+1+4)
-
-        if k == self.policy.num_gpu_batches - 1:
-            ( (w_o, donate[1]), ) = weight_read_buf.pop()
-        else:
-            ( (w_o, _       ),  ) = weight_read_buf.val
-
-        if i == 0:
-            q = hidden.val
-            h = self.compute.out_proj(q, w_o)
-        else:
-            q, new_k, new_v = hidden.val
-            (selected_k, donate[1]), (selected_v, donate[2]), \
-            (tail_k, donate[3]), (tail_v, donate[4]) = cache_read_buf.pop()
-
-            h = self.compute.gqa_after_proj(q, new_k, new_v, 
-                                            w_o, 
-                                            tail_k, tail_v, selected_k, selected_v  )        
-
-        hidden.val = h
-
-class MLP(TransformerComponent):
-    def __init__(self, config, env, policy, layer_id):
-        super().__init__(config, env, policy, layer_id)
-        self.compute = self.env.gpu
-        self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
-            else self.compute)
-
-        self.task = None
-
-    def init_weight(self, weight_home, path):
-        h, dtype = (self.config.hidden_size, self.config.dtype)
         layer_path = os.path.join(os.path.join(path, f"layers.{self.layer_id}"))
         mlp_path = layer_path + ".mlp"
+        
         
         intermediated_size = self.config.intermediate_size
         hidden_size = self.config.hidden_size
@@ -826,11 +415,14 @@ class MLP(TransformerComponent):
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        # mlp-load-weight
         w_gate, w_up, w_down , w_ln = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
+            # weight_read_buf.store((
+                # wi.smart_copy(dst1), bi.smart_copy(dst2),
+                # wo.smart_copy(dst1), bo.smart_copy(dst2),
+           #     w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
             weight_read_buf.store(
                 ( w_gate.smart_copy(dst1),
                 w_up.smart_copy(dst1),
@@ -838,145 +430,48 @@ class MLP(TransformerComponent):
                 w_ln.smart_copy(dst2) )
             )
 
+    def init_cache_one_gpu_batch(self, cache_home):
+        pass  # do nothing
+
+    def load_cache(self, cache_home, cache_read_buf, i):
+        pass  # do nothing
+
+    def store_cache(self, cache_home, cache_write_buf, i):
+        pass  # do nothing
 
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, position_embed,
                 cache_write_buf, i, k):
-        # forward-mlp
         donate = [False] * 7
         h, donate[0] = hidden.val, True
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            (   (w_gate,    donate[1]), 
+            (
+                (w_gate,    donate[1]), 
                 (w_up,      donate[2]), 
                 (w_down,    donate[3]), 
-                (w_ln,      donate[4])  ) = weight_read_buf.pop()
+                (w_ln,      donate[4])
+            ) = weight_read_buf.pop()
         else:
-            (   (w_gate,    _), 
+            (
+                (w_gate,    _), 
                 (w_up,      _), 
                 (w_down,    _), 
-                (w_ln,      _)  ) = weight_read_buf.val
+                (w_ln,      _)
+            ) = weight_read_buf.val
 
         h = self.compute.qwen_mlp(h, w_gate, w_up, w_down, w_ln, donate, self.layer_id)
         hidden.val = h
 
         dump_hidden(h.data, "final" , self.layer_id)
 
-
-class ShiftedTransformerLayer:
-    def __init__(self, config, env, policy, layerno):
-        self.layer_id = layerno
-        self.attn_after_proj = AttentionAfterProj(config, env, policy, layerno-1)
-        self.mlp = MLP(config, env, policy, layerno-1)
-        self.qkv_proj = QKVProj(config, env, policy, layerno)
-        
-        self.policy = policy
-        self.compute = env.gpu
-
-    def set_task(self, task):
-        self.qkv_proj.set_task(task)
-        self.mlp.set_task(task)
-        self.attn_after_proj.set_task(task)
-
-    def init_weight(self, weight_home, path):
-        
-        home1, home2, home3 = ValueHolder(),  ValueHolder(),ValueHolder()
-        
-        self.attn_after_proj.init_weight(home1, path)
-        self.mlp.init_weight(home2, path)
-        self.qkv_proj.init_weight(home3, path)
-
-        weight_home.store((home1, home2, home3))
-
-    def delete_cache(self, cache_home):
-        attn_cache_home, proj_cache_home = cache_home.pop()
-        self.attn_after_proj.delete_cache(attn_cache_home)
-        self.qkv_proj.delete_cache(proj_cache_home)
-
-    def init_cache_one_gpu_batch(self, cache_home):
-        proj_cache_home = ValueHolder()
-        
-        self.qkv_proj.init_cache_one_gpu_batch(proj_cache_home)
-        # self.attn_after_proj.init_cache_one_gpu_batch(attn_cache_home)
-
-        cache_home.store( ( None, proj_cache_home)   )
-
-    def load_weight(self, weight_home, weight_read_buf, k):
-        # transformerlayer-load-weight
-        if k == 0:
-            read_buf1, read_buf2, read_buf3 = ValueHolder(), ValueHolder(), ValueHolder()
-            home1, home2, home3 = weight_home.val
-            self.attn_after_proj.load_weight(home1, read_buf1, k)
-            self.mlp            .load_weight(home2, read_buf2, k)
-            self.qkv_proj       .load_weight(home3, read_buf3, k)
-
-            weight_read_buf.store((read_buf1, read_buf2, read_buf3))
-
-    def load_cache(self, cache_home, cache_read_buf, i):
-        """ transformer-load-cache"""
-        if i == 0:
-            return 
-
-        attn_cache_home, proj_cache_home = cache_home.val
-        attn_cache_buf, proj_cache_buf = ValueHolder(), ValueHolder()
-
-        self.attn_after_proj.load_cache(attn_cache_home, attn_cache_buf, i)
-        self.qkv_proj.load_cache(proj_cache_home, proj_cache_buf, i)
-        cache_read_buf.store(
-            (   attn_cache_buf, proj_cache_buf )
-        )
-
-    def forward(self, 
-                hidden, 
-                cache_read_buf, weight_read_buf, 
-                attention_mask, position_embedding, 
-                cache_write_buf, 
-                i, k):
-        # i : decode step
-        # k : id of gpu batch
-        if k == self.policy.num_gpu_batches - 1:
-            attn_read_buf, mlp_read_buf, proj_read_buf = weight_read_buf.pop()
-        else:
-            attn_read_buf, mlp_read_buf, proj_read_buf = weight_read_buf.val
-
-        if i == 0:
-            attn_cache_buf, proj_cache_buf = None, None
-        else:
-            attn_cache_buf, proj_cache_buf = cache_read_buf.pop()
-        
-        attn_cache_write_buf, proj_cache_write_buf = ValueHolder(), ValueHolder()
-
-
-        self.attn_after_proj.forward(hidden, 
-                                     attn_cache_buf, attn_read_buf, 
-                                     attention_mask, position_embedding, 
-                                     attn_cache_write_buf, 
-                                     i, k)
-
-        self.mlp.forward(hidden, None, mlp_read_buf, attention_mask, position_embedding, None,  i, k)
-
-        self.qkv_proj.forward(hidden, 
-                              proj_cache_buf, proj_read_buf, None, position_embedding, proj_cache_write_buf, i, k)
-
-        cache_write_buf.store(
-            (   attn_cache_write_buf, proj_cache_write_buf  )
-        )
-
-    def store_cache(self, cache_home, cache_write_buf, i):
-        attn_cache_write_buf, proj_cache_write_buf = cache_write_buf.pop()
-        attn_cache_home, proj_cache_home = cache_home.val
-        
-        # print(f" >>> step{i}, layer{self.layer_id}, store cache")
-        self.attn_after_proj.store_cache(attn_cache_home, attn_cache_write_buf, i)
-        self.qkv_proj.store_cache(proj_cache_home, proj_cache_write_buf, i)
-
 class TransformerLayer:
-    def __init__(self, config, env, policy, layer_id):
-        self.attention = SelfAttention(config, env, policy, layer_id)
-        self.mlp = MLP(config, env, policy, layer_id)
+    def __init__(self, config, env, policy, i):
+        self.attention = SelfAttention(config, env, policy, i)
+        self.mlp = MLP(config, env, policy, i)
         self.policy = policy
         self.compute = self.attention.compute
 
@@ -987,11 +482,10 @@ class TransformerLayer:
     def init_weight(self, weight_home, path):
         home1, home2 = ValueHolder(), ValueHolder()
         self.attention.init_weight(home1, path)
-        self.mlp      .init_weight(home2, path)
+        self.mlp.init_weight(home2, path)
         weight_home.store((home1, home2))
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        # transformerlayer-load-weight
         read_buf1, read_buf2 = ValueHolder(), ValueHolder()
         home1, home2 = weight_home.val
         self.attention.load_weight(home1, read_buf1, k)
@@ -1002,8 +496,6 @@ class TransformerLayer:
     def init_cache_one_gpu_batch(self, cache_home):
         self.attention.init_cache_one_gpu_batch(cache_home)
         
-    def load_summary(self, cache_home, cache_read_buf, i):
-        self.attention.load_summary(cache_home, cache_read_buf, i)
 
     def load_cache(self, cache_home, cache_read_buf, i):
         self.attention.load_cache(cache_home, cache_read_buf, i)
@@ -1020,14 +512,13 @@ class TransformerLayer:
         # i : decode step
         # k : id of gpu batch
         if k == self.policy.num_gpu_batches - 1:
-            attn_read_buf, mlp_read_buf = weight_read_buf.pop()
+            read_buf1, read_buf2 = weight_read_buf.pop()
         else:
-            attn_read_buf, mlp_read_buf = weight_read_buf.val
+            read_buf1, read_buf2 = weight_read_buf.val
 
-        self.attention.forward(hidden, cache_read_buf, attn_read_buf, 
-                               attention_mask, position_embedding, cache_write_buf, i, k)
-        self.mlp.forward(hidden, None, mlp_read_buf, attention_mask, position_embedding, None,  i, k)
-    
+        self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask, position_embedding, 
+                               cache_write_buf, i, k)
+        self.mlp.forward(hidden, None, read_buf2, attention_mask, position_embedding, None,  i, k)
 
 class InputEmbed:
     def __init__(self, config, env, policy):
@@ -1061,8 +552,6 @@ class InputEmbed:
             dst = self.weight_load_dst
             weight_read_buf.store((w_token.smart_copy(dst), ))
 
-    def delete_cache(self, cache_home):
-        pass
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
 
@@ -1090,8 +579,6 @@ class InputEmbed:
 
         h = self.compute.qwen_input_embed(h, w_token, self.config.pad_token_id, donate)
         hidden.val = h
-
-
 
 
 class OutputEmbed:
@@ -1130,9 +617,6 @@ class OutputEmbed:
             weight_read_buf.store(
                 (w_ln.smart_copy(dst2), w_token.smart_copy(dst1)))
 
-    def delete_cache(self, cache_home):
-        pass
-
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
 
@@ -1165,20 +649,31 @@ class OutputEmbed:
 
 class QwenLM:
     def __init__(self,
-                 config: QwenConfig,
+                 config: Union[str, QwenConfig],
                  env: ExecutionEnv,
                  path: str,
                  policy: Policy):
+
+        # path is the current
+        if isinstance(config, str):
+            config = get_qwen_config(config)
         self.config = config
         self.env = env
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
-        self.shift_forward = policy.sparse_config.mode == "block"
 
-        self.layers = None
-        self.num_layers = 0
-        self.construct_layers()
+        layers = []
+        layers.append(InputEmbed(self.config, self.env, self.policy))
+        for j in range(self.config.num_hidden_layers):
+            if policy.sep_layer:
+                layers.append(SelfAttention(self.config, self.env, self.policy, j))
+                layers.append(MLP(self.config, self.env, self.policy, j))
+            else:
+                layers.append(TransformerLayer(self.config, self.env, self.policy, j))
+        layers.append(OutputEmbed(self.config, self.env, self.policy))
+        self.layers = layers
+        self.num_layers = len(layers)
 
         if self.policy.act_gpu_percent == 100:
             self.act_home = self.env.gpu
@@ -1218,35 +713,6 @@ class QwenLM:
         for l in self.layers:
             l.set_task(task)
 
-    def construct_layers(self):
-        layers = []
-
-        num_hidden_layers = self.config.num_hidden_layers
-        
-        if self.policy.sparse_config.mode == "block":
-            layers.append(InputEmbed(self.config, self.env, self.policy))
-            layers.append(QKVProj(self.config, self.env, self.policy, 0))
-
-            for j in range(1, num_hidden_layers-1):
-                layers.append(ShiftedTransformerLayer(self.config, self.env, self.policy, j))
-                
-            layers.append(AttentionAfterProj(self.config, self.env, self.policy, num_hidden_layers-1))
-            layers.append(MLP(self.config, self.env, self.policy, num_hidden_layers-1))
-            layers.append(OutputEmbed(self.config, self.env, self.policy))
-
-        else:
-            layers.append(InputEmbed(self.config, self.env, self.policy))
-            for j in range(num_hidden_layers):
-                if self.policy.sep_layer:
-                    layers.append(SelfAttention(self.config, self.env, self.policy, j))
-                    layers.append(MLP(self.config, self.env, self.policy, j))
-                else:
-                    layers.append(TransformerLayer(self.config, self.env, self.policy, j))
-            layers.append(OutputEmbed(self.config, self.env, self.policy))
-
-        self.layers = layers
-        self.num_layers = len(self.layers)
-
     def init_weight(self, j):
         expanded_path = os.path.abspath(os.path.expanduser(
             os.path.join(self.path, f"{self.config.name}-np")))
@@ -1257,8 +723,7 @@ class QwenLM:
 
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
 
-    def load_weight(self, i, j, k, overlap=True):         # generate-load-weight
-        # gen-load-weight
+    def load_weight(self, i, j, k, overlap=True):
         # Handle corner cases
         if j == self.num_layers:
             j = 0
@@ -1298,7 +763,6 @@ class QwenLM:
             if i == self.execute_gen_len:
                 return
 
-        # print(f" >>> load cache: ({i},{j},{k})")
         # Load from cache_home to cache_read_buf
         if overlap:
             with torch.cuda.stream(self.load_cache_stream):
@@ -1329,12 +793,10 @@ class QwenLM:
             self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
 
     def delete_cache(self, j, k):
-        if self.policy.sparse_config.mode == "block":
-            self.layers[j].delete_cache(self.cache_home[j][k])
-
-    def move_hidden(self, i, j, k):
-        self.store_hidden(i, j-1, k)
-        self.load_hidden(i, j, k)
+        v = self.cache_home[j][k].pop()
+        if v:
+            for x in v:
+                x.delete()
 
     def load_hidden(self, i, j, k):
         # Handle corner cases
@@ -1360,7 +822,7 @@ class QwenLM:
                 val = dst.allocate((gpu_batch_size, 1), np.int32)
                 val.load_from_np(self.output_ids[left:right, pos-1:pos])
         else:  # load from the last layer
-            val = self.hidden[i][j-1][k].pop()  #.move(dst)
+            val = self.hidden[i][j-1][k].pop().move(dst)
         self.hidden[i][j][k].store(val)
 
     def store_hidden(self, i, j, k):
@@ -1387,25 +849,19 @@ class QwenLM:
                 stopped[:] = np.logical_or(stopped, ids == self.task.stop)
             else:
                 self.output_ids[left:right, pos:pos+1] = ids
-        # else:  # move to home
-        #     x = self.hidden[i][j][k]
-        #     if x.val:  # x may already be moved due to overlapping
-        #         x.val = x.val.move(self.act_home)
+        else:  # move to home
+            x = self.hidden[i][j][k]
+            if x.val:  # x may already be moved due to overlapping
+                x.val = x.val.move(self.act_home)
 
     def compute_layer(self, i, j, k):
         # Update the hidden in place
         # Clear the weight_read_buf if it is the last gpu batch
         # Clear the cache_read_buf
         # Run layer computation
-
-        # input/output embed layer
-        self.layers[j].forward(
-                self.hidden[i][j][k], 
-                self.cache_read_buf[j][k],
-                self.weight_read_buf[j], 
-                self.attention_mask[k], 
-                self.position_embedding[k], 
-                self.cache_write_buf[j][k], i, k)
+        self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
+            self.weight_read_buf[j], self.attention_mask[k], self.position_embedding[k], 
+            self.cache_write_buf[j][k], i, k)
 
     def sync(self):
         self.env.disk.synchronize()
@@ -1464,38 +920,7 @@ class QwenLM:
         #     position_embed = self.position_embedding[k]
         #     assert position_embed.val is not None
         #     position_embed.val = position_embed.val.device.extend_position_embedding(position_embed, )
-    def link_cache(self, j, k):
-        if j == 2:
-            _, proj_cache_home = self.cache_home[j][k].pop()
-            last_proj_home = self.cache_home[j-1][k]
-            self.cache_home[j][k].store(    (last_proj_home, proj_cache_home)   )
-            
-        elif j > 2 and j < self.num_layers-3:
-            _, proj_cache_home = self.cache_home[j][k].pop()
-            _, last_proj_home = self.cache_home[j-1][k].val
-            self.cache_home[j][k].store(    (last_proj_home, proj_cache_home)   )
 
-        elif j == self.num_layers - 3:
-            _, proj_cache_home = self.cache_home[j-1][k].val
-            self.cache_home[j][k] = proj_cache_home
-
-    def check_cache(self):
-        for j in range(self.num_layers):
-            for k in range(self.num_gpu_batches):
-                cache = self.cache_home[j][k]
-                assert isinstance(cache, ValueHolder)
-                if j == 0 or j == self.num_layers - 1:
-                    assert cache.val is None
-                elif j == 1:
-                    # assert isinstance(cache, ValueHolder)
-                    assert isinstance(cache.val, tuple)
-                elif j == self.num_layers - 2:  # mlp
-                    assert self.cache_home[j][k].val is None
-                elif j == self.num_layers -3:   # attn
-                    assert isinstance(self.cache_home[j][k], ValueHolder)
-                else:
-                    assert isinstance(cache.val, tuple) and len(cache.val) == 2
-                
     def generate(self,
                  inputs: Union[np.ndarray, List[List[int]]],
                  max_new_tokens: int = 32,
@@ -1526,6 +951,7 @@ class QwenLM:
         self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
             self.config.pad_token_id, dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
+        print(f" >>> shape of input: {self.output_ids.shape}")
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
         assert gpu_batch_size * num_gpu_batches == len(task.inputs)
 
@@ -1538,14 +964,11 @@ class QwenLM:
                 self.cache_home[j][k].clear()
                 self.cache_read_buf[j][k].clear()
                 self.cache_write_buf[j][k].clear()
-
         for j in range(num_layers):
             self.weight_read_buf[j].clear()
-
         for k in range(num_gpu_batches):
             self.attention_mask[k].clear()
             self.position_embedding[k].clear()
-
         self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
 
         # Init cache
@@ -1553,20 +976,12 @@ class QwenLM:
         for j in range(num_layers):
             for k in range(num_gpu_batches):
                 self.init_cache(j, k)
-        if self.policy.sparse_config.mode == "block":
-            for j in range(num_layers):
-                for k in range(num_gpu_batches):
-                    self.link_cache(j, k)
-            self.check_cache()
-            
         if self.policy.cpu_cache_compute:
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
 
         # Generate
         if debug_mode is None:
-            if self.policy.sparse_config.mode == "block":
-                self.generation_loop_block_sparse()
-            elif not overlap:
+            if not overlap:
                 # No overlap, easy to understand, suitable for debugging
                 self.generation_loop_normal()
             else:
@@ -1616,40 +1031,6 @@ class QwenLM:
                     self.store_hidden(i, j, k)
                     self.store_cache(i, j, k, overlap=False)
             timers("generate").stop()
-
-    def generation_loop_block_sparse(self):
-        # gen-loop-sparse
-        # use config to determine which to use
-        # return self.generation_loop_overlap_multi_batch()
-        print(f" >>> gen-loop-blocksparse")
-        for k in range(self.num_gpu_batches):
-            self.load_weight(0, 0, k)
-        self.load_hidden(0, 0, 0)
-        self.sync()
-
-        # Generate
-        for i in range(self.execute_gen_len):
-            print(f" >>> step-{i}") 
-            timers("generate").start()
-            for k in range(self.num_gpu_batches):
-                self.update_attention_mask(i, k)
-                self.update_position_embedding(i, k)
-            for j in range(self.num_layers):
-                for k in range(self.num_gpu_batches):
-                    self.store_hidden(i, j, k-1)
-                    self.store_cache(i, j, k-1)
-
-                    self.load_weight(i, j+1, k)
-                    self.load_hidden(i, j, k+1)
-                    self.load_cache(i, j, k+1)
-
-                    self.compute_layer(i, j, k)
-                    self.sync()
-            timers("generate").stop()
-
-        # Epilogue
-        self.store_hidden(
-            self.execute_gen_len-1, self.num_layers-1, self.num_gpu_batches-1)
 
     def generation_loop_debug_normal(self):
         execute_num_batches = 20
@@ -1735,7 +1116,6 @@ class QwenLM:
                 print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
 
     def generation_loop_overlap_single_batch(self):
-        # gen-loop-sparse
         # Prologue
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)
@@ -1743,17 +1123,15 @@ class QwenLM:
 
         # Generate
         for i in range(self.execute_gen_len):
-            print(f" >>> step-{i}")
             timers("generate").start()
             self.update_attention_mask(i, 0)
             self.update_position_embedding(i, 0)
 
             for j in range(self.num_layers):
-                self.load_hidden(i, j, 0)
-                self.compute_layer(i, j, 0)
-
                 self.load_weight(i, j+1, 0)
                 self.load_cache(i, j+1, 0)
+                self.load_hidden(i, j, 0)
+                self.compute_layer(i, j, 0)
                 self.store_cache(i, j-1, 0)
                 self.store_hidden(i, j, 0)
                 self.sync()
@@ -1763,7 +1141,7 @@ class QwenLM:
                 break
 
     def generation_loop_overlap_multi_batch(self):
-        # generate-loop-overlap
+        print(f" >>> loop overlap multi batch")
         # Prologue
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)
@@ -1772,7 +1150,6 @@ class QwenLM:
 
         # Generate
         for i in range(self.execute_gen_len):
-            print(f" >>> step-{i}")
             timers("generate").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
@@ -1783,8 +1160,8 @@ class QwenLM:
                     self.load_cache(i, j, k+1)
                     self.store_hidden(i, j, k-1)
                     self.load_hidden(i, j, k+1)
-                    self.store_cache(i, j, k-1)
                     self.compute_layer(i, j, k)
+                    self.store_cache(i, j, k-1)
                     self.sync()
             timers("generate").stop()
 
@@ -1939,10 +1316,8 @@ def basic_test(args):
     print(outputs)
 
 def predict_mem_and_log(qwen_config, num_prompts, prompt_len, gen_len):
-    context_len = prompt_len + gen_len 
-    cache_size = qwen_config.cache_bytes(num_prompts, context_len)
-    hidden_size = qwen_config.hidden_bytes(num_prompts, context_len)
-    print(f" >>> genlen: {context_len}, ")
+    cache_size = qwen_config.cache_bytes(num_prompts, prompt_len + gen_len)
+    hidden_size = qwen_config.hidden_bytes(num_prompts, prompt_len + gen_len)
     print(f"model size: {qwen_config.model_bytes()/GB:.3f} GB, "
     f"cache size: {cache_size/GB:.3f} GB, "
     f"hidden size (prefill): {hidden_size/GB:.3f} GB")
@@ -1964,6 +1339,9 @@ def run_flexllmgen(args):
     # Task and policy
     if args.input_file is not None:  
         input_in_tokens = get_file_inputs(args.input_file, num_prompts, tokenizer, args.prompt_len)
+        # input_in_tokens = tokenizer(inputs, padding="longest").input_ids
+        # TODO
+        # prompt-len settings not set
     elif args.prompt_len is not None:
         input_in_tokens = get_test_inputs(args.prompt_len, num_prompts, tokenizer)
     else:
@@ -2031,7 +1409,6 @@ def run_flexllmgen(args):
     else:
         filename = args.log_file
 
-    
     log_str = write_benchmark_log(filename,
         qwen_config.model_bytes(), cache_size, hidden_size,
         gpu_peak_mem, projected, prefill_latency, prefill_throughput,
@@ -2055,10 +1432,8 @@ def add_parser_arguments(parser):
             help="combined with input-file, get the front tokens, default: None, use the longest-padding of tokenizer")
     parser.add_argument("--debug-mode", type=str,
         choices=["fewer_batch", "breakdown", "output_hidden", "basic"])
-
     parser.add_argument("--gpu-batch-size", type=int, default=4)
     parser.add_argument("--num-gpu-batches", type=int, default=1)
-
     parser.add_argument("--percent", nargs="+", type=int,
         default=[100, 0, 100, 0, 100, 0],
         help="Six numbers. They are "
@@ -2074,9 +1449,9 @@ def add_parser_arguments(parser):
         const=True, default=True)
 
     parser.add_argument("--cpu-cache-compute", action="store_true")
-    parser.add_argument("--sparse-mode", type=str, choices=["dense", "naive", "block"], default="dense")
+    parser.add_argument("--sparse-mode", type=str, default="dense")
     parser.add_argument("--attn-sparsity", type=float, default=1.0)
-    parser.add_argument("--sparse-block-size", type=int, default=16)
+    parser.add_argument("--sparse-block-size", type=int, default=64)
     
     parser.add_argument("--compress-weight", action="store_true",
         help="Whether to compress weight.")

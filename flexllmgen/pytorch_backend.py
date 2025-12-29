@@ -16,7 +16,7 @@ import numpy as np
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes, expand_block_idx, ValueHolder, num_block, 
-    bhsd_to_cache_shape, tail_length, bhsd_to_bsH)
+    to_cache_home_shape, tail_length, bhsd_to_bsH)
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -52,7 +52,7 @@ def dump_hidden(torch_obj, name, layerno=None, seq_len=None):
     torch.save(torch_obj, save_name)
  
 def repeat_interleave(kv_data, n_qhead, n_kvhead):
-    assert len(kv_data.shape) == 4
+    assert len(kv_data.shape) == 4, f" >>> shape:{kv_data.shape}"
     return torch.repeat_interleave(kv_data, n_qhead//n_kvhead, dim=1)
 
 def check_idx(idx):
@@ -81,8 +81,9 @@ def cache_shape(config, task, policy):
 
     return shape
 
-def extract_cache_to_bhsd(cache, b, n_head, s, d):
-    return cache.data[:s].view(s, b, n_head, d).permute(1,2,0,3)
+def from_cache_home_shape(cache, b, n_head, s, d):
+    # return cache[:s].view(s, b, n_head, d).permute(1,2,0,3)
+    return cache
   
     # k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
 
@@ -103,8 +104,6 @@ def select_topk(v:torch.Tensor, indices:torch.Tensor):
     idx_b = torch.arange(b).view(-1,1,1).expand(*select_shape)
     idx_h = torch.arange(n_kvhead).repeat_interleave(group_size).view(1, -1, 1).expand(*select_shape)
     idx_k = indices.flatten().view(*select_shape)
-    # assert idx_b.shape == idx_k.shape and idx_h.shape == idx_k.shape, \
-    #     f" >>>>>> idx_b: {idx_b.shape}, idx_h: {idx_h.shape}, idx_k:{idx_k.shape}"
 
     return v[idx_b, idx_h, idx_k]
 
@@ -259,7 +258,7 @@ class TorchTensor:
 
     def smart_copy(self, dst, src_indices=None):
         """ dst is TorchDevice"""
-        if self.device == dst:
+        if self.device == dst and src_indices is None:
             return self, False
         return self.copy(dst, src_indices=src_indices), True
 
@@ -504,7 +503,6 @@ class TorchDevice:
                 )
         shape = (prompt_len + gen_len-1, gpu_batch_size *n_head, hidden_size//n_head)
 
-        # print(f" >>> init cache in shape: {shape}")
         # shape = cache_shape(config, task, policy)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
@@ -570,7 +568,12 @@ class TorchDevice:
                                  w_q.data, b_q.data, w_k.data, b_k.data, w_v.data, b_v.data, w_ln.data,
                                  n_head)
         
-        if enable_sparse:
+        if not enable_sparse:
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            summary = None
+            # bhsd -> bshd -> bsH
+            attn_out = bhsd_to_bsH(attn_out)
+        else:
             last_q = q[:, :, -block_size:]
             k1 = torch.repeat_interleave(k, n_qhead//n_kvhead, dim=1)
             attn_score = torch.matmul(last_q, k1.transpose(2, 3))
@@ -583,12 +586,9 @@ class TorchDevice:
             # (b, h, s, k)
             attn_weight = torch.softmax(sparse_attn_score, dim=-1)
 
-            # print(f" >>> n-sample-kv:{n_sample_kv}")
-
             # (b, h, s, k) * (b, h, k, d) -> (b, h, s, d)
             v1 = repeat_interleave(v[:, :, -n_sample_kv:], n_qhead, n_kvhead)
 
-            # print(f" >>> shape of attn_weight: {attn_weight.shape}")
             attn_out = torch.matmul(attn_weight, v1)
 
             attn_out = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
@@ -596,16 +596,8 @@ class TorchDevice:
             tail_len = s % block_size + block_size
             n_blk = num_block(s, block_size)
             summary = k[:,:,:-tail_len].reshape(b, n_kvhead, n_blk, block_size, head_dim).mean(dim=-2)
-
-            # print(f" >>> shape of summary: {summary.shape}")
             
             summary = TorchTensor.create_from_torch(summary, self)
-
-        else:
-            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
-            summary = None
-            # bhsd -> bshd -> bsH
-            attn_out = bhsd_to_bsH(attn_out)
         
         return TorchTensor.create_from_torch(attn_out, self), \
             TorchTensor.create_from_torch(k, self), \
@@ -617,7 +609,7 @@ class TorchDevice:
                         w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
                         tail_k, tail_v, k_summary,
                         n_head, context_len, enable_sparse=False, block_size=None):
-        """ k_summary: (b, h, blk, d)"""
+        """ k_summary: (b, h, blk, d) """
         head_dim = h.shape[-1]
         cos = position_embed.data[0][context_len-1:context_len]
         sin = position_embed.data[1][context_len-1:context_len]
@@ -649,8 +641,6 @@ class TorchDevice:
                 tail_len = tail_length(context_len, block_size)
                 last_block = torch.concat([tail_k.data, k], dim=2)
 
-                # print(f" >>> shape of k: {k.shape}")
-                # print(f" >>> shape of tail_k.data: {tail_k.data.shape}")
                 assert last_block.shape[2] == block_size, \
                     f" !!!block-size:{last_block.shape[2]}, context-len:{context_len}"
 
@@ -704,9 +694,9 @@ class TorchDevice:
         
         return k
 
-    def gqa_after_proj(self, q, k, v, 
+    def gqa_after_proj(self, q, new_k, new_v, 
                        w_o, 
-                       tail_k, tail_v, k_cache, v_cache):
+                       tail_k, tail_v, selected_k, selected_v):
         """ q:      (b, head, s, d)
             kv:     (s, b*head, d)
             ret:    (b,head, s, d)
@@ -714,28 +704,30 @@ class TorchDevice:
         b, n_qhead, s, head_dim = q.shape
         n_kvhead = tail_k.shape[1]
         
-        q, k,v = q.data, k.data, v.data
+        q, new_k,new_v = q.data, new_k.data, new_v.data
 
         # (b, head, s, d)
         concated_k = []
         concated_v = []
-        if k_cache is not None:
-            k_cache = k_cache.data
-            v_cache = v_cache.data
-            if k_cache.shape[-2] != n_qhead:
-                k_cache = repeat_interleave(k_cache, n_qhead, n_kvhead)
-                v_cache = repeat_interleave(v_cache, n_qhead, n_kvhead)
-            concated_k.append(k_cache)
-            concated_v.append(v_cache)
+        if selected_k is not None:
+            selected_k = selected_k.data
+            selected_v = selected_v.data
+            if selected_k.shape[1] != n_qhead:
+                selected_k = repeat_interleave(selected_k, n_qhead, n_kvhead)
+                selected_v = repeat_interleave(selected_v, n_qhead, n_kvhead)
+            concated_k.append(selected_k)
+            concated_v.append(selected_v)
             
         if tail_k is not None:
-            tail_k = torch.repeat_interleave(tail_k.data, n_qhead//n_kvhead, dim=1)
-            tail_v = torch.repeat_interleave(tail_v.data, n_qhead//n_kvhead, dim=1)
+            tail_k = repeat_interleave(tail_k.data, n_qhead, n_kvhead)
+            tail_v = repeat_interleave(tail_v.data, n_qhead, n_kvhead)
             concated_k.append(tail_k)
             concated_v.append(tail_v)
         
-        concated_k.append(k)
-        concated_v.append(v)
+        new_k = repeat_interleave(new_k, n_qhead, n_kvhead)
+        new_v = repeat_interleave(new_v, n_qhead, n_kvhead)
+        concated_k.append(new_k)
+        concated_v.append(new_v)
         
         k = torch.concat(concated_k, dim=-2)
         v = torch.concat(concated_v, dim=-2)
@@ -816,8 +808,9 @@ class TorchDevice:
         if donate[1]: attention_mask.delete()
 
         #  (b, n_head, s, d) -> (s, b, head, d) -> (s, b * n_head, d)
-        k = bhsd_to_cache_shape(k_pos)
-        v = bhsd_to_cache_shape(v)
+        
+        k = to_cache_home_shape(k_pos)
+        v = to_cache_home_shape(v)
     
 
         if compress_cache:
@@ -913,12 +906,11 @@ class TorchDevice:
         src_s = attention_mask.shape[-1]
         b, n_qhead, tgt_s, head_dim = q.shape
         n_kvhead = k_new.shape[1]
-        k = extract_cache_to_bhsd(k_cache, b, n_kvhead, src_s, head_dim)
-        v = extract_cache_to_bhsd(v_cache, b, n_kvhead, src_s, head_dim)
+        k = from_cache_home_shape(k_cache.data, b, n_kvhead, src_s, head_dim)
+        v = from_cache_home_shape(v_cache.data, b, n_kvhead, src_s, head_dim)
         
         # k = k_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
         # v = v_cache.data[:src_s].view(src_s, b, n_kvhead, head_dim).permute(1, 2, 0, 3)
-
         dump_hidden(k, f"load-k", layerno, src_s-1)
     
         k[:, :, src_s-1:src_s, :] = k_new
@@ -929,7 +921,8 @@ class TorchDevice:
 
         # mask: (B, S) -> (B, 1, 1, S)
         mask = attention_mask.data.view(b, 1, 1, -1)
-        value = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+        # value = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+        value = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
         return value
 
     def gqa_gen(self, inputs, attention_mask, position_embed, w_q, b_q, w_k, b_k, w_v, b_v,
@@ -1009,8 +1002,8 @@ class TorchDevice:
         dump_hidden(v1_cache, "store-v", layerno, src_s-1)
 
         # (b, head, tgt_s, h) -> (tgt_s, b, head, h) -> (tgt_s, b*head, h)
-        k1_cache = bhsd_to_cache_shape(k1_cache)
-        v1_cache = bhsd_to_cache_shape(v1_cache)
+        k1_cache = to_cache_home_shape(k1_cache)
+        v1_cache = to_cache_home_shape(v1_cache)
 
         # cache compression related
         if compress_cache:
@@ -1224,7 +1217,7 @@ class TorchDevice:
 
         group_size = n_qhead // n_kvhead
         #get kcache
-        k = extract_cache_to_bhsd(k_cache, b, n_kvhead, src_s, head_dim)
+        k = from_cache_home_shape(k_cache, b, n_kvhead, src_s, head_dim)
         
         # attn-score    (b, qhead, 1, s)
         attn_weights = self._gqa_attn_weights(q, k, mask)
@@ -1240,7 +1233,7 @@ class TorchDevice:
             attn_weights[:, :, :, -1:]], dim=-1)
     
         # temporary on cuda, using only
-        v = extract_cache_to_bhsd(v_cache, b, n_kvhead, src_s, head_dim)
+        v = from_cache_home_shape(v_cache, b, n_kvhead, src_s, head_dim)
 
         # (b, head, k, d)
         v = select_topk(v, topk_indices)
