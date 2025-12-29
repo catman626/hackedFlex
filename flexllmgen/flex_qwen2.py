@@ -2069,7 +2069,7 @@ def add_parser_arguments(parser):
          "the percentage of activations on GPU, "
          "the percentage of activations on CPU")
     parser.add_argument("--sep-layer", type=str2bool, nargs='?',
-        const=True, default=True)
+        const=True, default=False)
     parser.add_argument("--pin-weight", type=str2bool, nargs="?",
         const=True, default=True)
 
