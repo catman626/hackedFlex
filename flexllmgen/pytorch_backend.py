@@ -16,7 +16,7 @@ import numpy as np
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes, expand_block_idx, ValueHolder, num_block, 
-    to_cache_home_shape, tail_length, bhsd_to_bsH)
+    to_cache_home_shape, tail_length, bhsd_to_bsH, bsH_to_bhsd)
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -414,6 +414,7 @@ class TorchDevice:
 
         # output embedding
         logits = F.linear(hidden, w_token.data)
+        
         last_token_logits = logits[:,-1,:]
 
         if do_sample and not temperature < 1e-5:
@@ -446,19 +447,20 @@ class TorchDevice:
 
         b, s, h = inputs.shape
 
-        hidden = rms_layernorm(inputs.data, w_ln.data)
+        hidden = inputs.data[:,-1]
+        hidden = rms_layernorm(hidden, w_ln.data)
         # hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
         if donate[0]: inputs.delete()
 
         # output embedding
         logits = F.linear(hidden, w_token.data)
-        last_token_logits = logits[:,-1,:]
+        last_token_logits = logits
 
         if do_sample and not temperature < 1e-5:
             probs = torch.softmax(last_token_logits / temperature, dim=-1)
             ids = torch.multinomial(probs, num_samples=1)
         else:
-            ids = last_token_logits.argmax(dim=1, keepdim=True)
+            ids = last_token_logits.argmax(dim=-1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
     def init_cache_one_gpu_batch_qwen(self, config, task, policy):
@@ -512,45 +514,12 @@ class TorchDevice:
         return k_cache, v_cache
 
     def out_proj(self, h, w_o):
+
         h = F.linear(h.data, w_o.data)
 
         return TorchTensor.create_from_torch(h, self)
 
-    def _qkv_proj(self, h, 
-                 attn_mask, position_embed, 
-                 w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
-                 n_head, return_form="bhsd"):
-        """ input, return:  torch.tensor
-            return: (b, h, s, d) 
-        """
-        hidden =  rms_layernorm(h, w_ln)
-        cos, sin = position_embed
-        n_qhead, n_kvhead = n_head
-        b, s, h = h.shape
-        head_dim = h//n_qhead
-
-        # shape: (b, s, h)
-        q = F.linear(hidden, w_q, bias=b_q) 
-        k = F.linear(hidden, w_k, bias=b_k)
-        v = F.linear(hidden, w_v, bias=b_v)
-
-        # shape: (b, s, n_head, head_dim) -> (b, head, s, head_dim)
-        q = q.view(b, s, n_qhead,  head_dim).transpose(1,2)
-        k = k.view(b, s, n_kvhead, head_dim).transpose(1,2)
-        v = v.view(b, s, n_kvhead, head_dim).transpose(1,2)
-
-        # (b, head, s, d)
-        q_pos = apply_rope(q, (cos, sin), unsqueeze_dim=0)
-        k_pos = apply_rope(k, (cos, sin), unsqueeze_dim=0)
-
-        if return_form == "bsH":
-            q_pos = bhsd_to_bsH(q_pos)
-            k_pos = bhsd_to_bsH(k_pos)
-            v = bhsd_to_bsH(v)
-
-        return q_pos, k_pos, v 
-
-    def qkv_proj_prefill(self, h, attn_mask, position_embed, 
+    def prefill_proj(self, h, attn_mask, position_embed, 
                          w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
                          n_head, enable_sparse=False, block_size=0):
         """ return q:(bsH)"""
@@ -569,6 +538,7 @@ class TorchDevice:
         
         if not enable_sparse:
             attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            # attn_out = q
             summary = None
             # bhsd -> bshd -> bsH
             attn_out = bhsd_to_bsH(attn_out)
@@ -602,7 +572,7 @@ class TorchDevice:
                 TorchTensor.create_from_torch(v, self), \
                     summary
 
-    def qkv_proj_decode(self, 
+    def decode_proj(self, 
                         h, attn_mask, position_embed, 
                         w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
                         tail_k, tail_v, k_summary,
@@ -665,7 +635,6 @@ class TorchDevice:
                 TorchTensor.create_from_torch(k, self),  \
                 TorchTensor.create_from_torch(v, self), \
                 summary_ret, idx
-
        
     def _summary(self, k, block_size, new_k=None, block_range=None):
         """ k, v: (s, b*h, d) 
@@ -821,7 +790,6 @@ class TorchDevice:
 
 
         return TorchTensor.create_from_torch(attn_output, self), k, v
-    
 
     def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
             w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config):
@@ -1409,6 +1377,44 @@ class TorchDevice:
 
     def __str__(self):
         return f"TorchDevice(name={self.name})"
+
+    def _qkv_proj(self, h, 
+                 attn_mask, position_embed, 
+                 w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
+                 n_head, return_form="bhsd"):
+        """ input, return:  torch.tensor
+            return: q,k,v in (b, h, s, d) 
+        """
+        # dummy
+        n_qhead, n_kvhead = n_head
+        return bsH_to_bhsd(h, n_qhead),bsH_to_bhsd(h, n_qhead),bsH_to_bhsd(h, n_qhead)
+        
+        hidden =  rms_layernorm(h, w_ln)
+        cos, sin = position_embed
+        n_qhead, n_kvhead = n_head
+        b, s, h = h.shape
+        head_dim = h//n_qhead
+
+        # shape: (b, s, h)
+        q = F.linear(hidden, w_q, bias=b_q) 
+        k = F.linear(hidden, w_k, bias=b_k)
+        v = F.linear(hidden, w_v, bias=b_v)
+
+        # shape: (b, s, n_head, head_dim) -> (b, head, s, head_dim)
+        q = q.view(b, s, n_qhead,  head_dim).transpose(1,2)
+        k = k.view(b, s, n_kvhead, head_dim).transpose(1,2)
+        v = v.view(b, s, n_kvhead, head_dim).transpose(1,2)
+
+        # (b, head, s, d)
+        q_pos = apply_rope(q, (cos, sin), unsqueeze_dim=0)
+        k_pos = apply_rope(k, (cos, sin), unsqueeze_dim=0)
+
+        if return_form == "bsH":
+            q_pos = bhsd_to_bsH(q_pos)
+            k_pos = bhsd_to_bsH(k_pos)
+            v = bhsd_to_bsH(v)
+
+        return q_pos, k_pos, v 
 
 
 class TorchDisk:

@@ -368,33 +368,6 @@ class SelfAttention:
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
     
-    def forward_qkvproj(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                position_embeddings, cache_write_buf, i, k):
-        donate = [False] * (1+1+1+7)
-        # 0:hidden, 1:mask, 2:pos_embd, 345678 qkv_wb, 9 w_ln
-        
-        h, donate[0] = hidden.val, True
-        
-        n_qhead = self.config.num_attention_heads
-        n_kvhead = self.config.num_key_value_heads
-
-        if k == self.policy.num_gpu_batches - 1:
-            (( w_q,  donate[3]), (b_q, donate[4]), 
-            (  w_k, donate[5]), (b_k, donate[6]),
-            (  w_v, donate[7]), (b_v, donate[8]),
-            (  w_ln, donate[9])) = weight_read_buf.val.pop()
-        else:
-            # (w, _),  = weight_read_buf.val
-            ( (w_q, _), (b_q, _), (w_k, _), (b_k, _), (w_v, _), (b_v, _), (w_ln, _) ) = weight_read_buf.val
-
-        position_embed, donate[2] = position_embeddings.val.smart_copy(self.compute)
-        q, k, v= self.compute.qkv_proj(h, w_q, b_q, w_k, b_k, w_v, b_v, position_embeddings)
-        K_summary, v_summary = self.compute.kv_summary(k, v)
-        cache_write_buf.store((k, v, k_summary, v_summary))
-
-        hidden.val = q
-
-
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 position_embeddings, cache_write_buf, i, k):
         # forward-attn
@@ -563,7 +536,7 @@ class QKVProj(TransformerComponent):
                 tail_len = tail_length(context_len, block_size)
                 n_blk = num_block(context_len, block_size)
 
-                summary_idx = (slice(None), slice(None), slice(0, n_blk))
+                summary_idx = cache_slice(0, n_blk)
                 if context_len % block_size == 0:
                     tail_k_idx = cache_slice(context_len-tail_len, context_len-1)    
                     cache_read_buf.store(
@@ -652,7 +625,7 @@ class QKVProj(TransformerComponent):
         block_size = self.policy.sparse_config.block_size
 
         if i == 0:
-            q, k, v, k_summary = self.compute.qkv_proj_prefill(h, 
+            q, k, v, k_summary = self.compute.prefill_proj(h, 
                                                                None, position_embed, 
                                                                w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
                                                                (n_qhead, n_kvhead), 
@@ -663,7 +636,7 @@ class QKVProj(TransformerComponent):
         else:
             (tail_k, donate[2]), (tail_v, donate[2]), \
             (summary, donate[2]), (idx_home, idx_cnt)= cache_read_buf.pop()
-            q, k, v, new_summary, idx = self.compute.qkv_proj_decode(
+            q, k, v, new_summary, idx = self.compute.decode_proj(
                 h, None, position_embed, 
                 w_q, b_q, w_k, b_k, w_v, b_v, w_ln,
                 tail_k, tail_v, summary, (n_qhead, n_kvhead), context_len, 
@@ -797,7 +770,7 @@ class AttentionAfterProj(TransformerComponent):
 class MLP(TransformerComponent):
     def __init__(self, config, env, policy, layer_id):
         super().__init__(config, env, policy, layer_id)
-        self.compute = self.env.gpu
+        self.compute:TorchDevice= self.env.gpu
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
             else self.compute)
 
@@ -1176,7 +1149,7 @@ class QwenLM:
         self.num_gpu_batches = policy.num_gpu_batches
         self.shift_forward = policy.sparse_config.mode == "block"
 
-        self.layers = None
+        self.layers:List= None
         self.num_layers = 0
         self.construct_layers()
 
@@ -1210,7 +1183,7 @@ class QwenLM:
         # position_embedding[k]
         self.position_embedding = array_1d(num_gpu_batches, ValueHolder)
 
-        self.task = None
+        self.task:Task= None
         self.init_all_weights()
 
     def set_task(self, task):
@@ -1566,6 +1539,7 @@ class QwenLM:
         if debug_mode is None:
             if self.policy.sparse_config.mode == "block":
                 self.generation_loop_block_sparse()
+                # self.profile_gen_loop()
             elif not overlap:
                 # No overlap, easy to understand, suitable for debugging
                 self.generation_loop_normal()
@@ -1634,6 +1608,7 @@ class QwenLM:
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
                 self.update_position_embedding(i, k)
+                pass
             for j in range(self.num_layers):
                 for k in range(self.num_gpu_batches):
                     self.store_hidden(i, j, k-1)
@@ -1646,10 +1621,22 @@ class QwenLM:
                     self.compute_layer(i, j, k)
                     self.sync()
             timers("generate").stop()
-
         # Epilogue
-        self.store_hidden(
-            self.execute_gen_len-1, self.num_layers-1, self.num_gpu_batches-1)
+        # self.store_hidden(
+        #     self.execute_gen_len-1, self.num_layers-1, self.num_gpu_batches-1)
+
+    def profile_gen_loop(self):
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA,
+                        torch.profiler.ProfilerActivity.CPU],
+            profile_memory=True,
+            record_shapes=True,
+            with_stack=True
+        ) as prof:
+            self.generation_loop_block_sparse()
+
+        print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10))
+        prof.export_chrome_trace("trace_memory.json")
 
     def generation_loop_debug_normal(self):
         execute_num_batches = 20
@@ -1757,6 +1744,7 @@ class QwenLM:
                 self.store_cache(i, j-1, 0)
                 self.store_hidden(i, j, 0)
                 self.sync()
+
             timers("generate").stop()
 
             if self.task.stop and np.all(self.stopped):
@@ -2076,7 +2064,7 @@ def add_parser_arguments(parser):
     parser.add_argument("--cpu-cache-compute", action="store_true")
     parser.add_argument("--sparse-mode", type=str, choices=["dense", "naive", "block"], default="dense")
     parser.add_argument("--attn-sparsity", type=float, default=1.0)
-    parser.add_argument("--sparse-block-size", type=int, default=16)
+    parser.add_argument("--sparse-block-size", type=int, default=64)
     
     parser.add_argument("--compress-weight", action="store_true",
         help="Whether to compress weight.")

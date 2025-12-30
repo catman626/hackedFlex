@@ -341,5 +341,11 @@ def bhsd_to_bsH(t:torch.Tensor):
     r = t.permute(0, 2, 1, 3).reshape(b, s, h*d)
     return r
 
+def bsH_to_bhsd(t:torch.Tensor,n_head:int):
+    b, s, H = t.shape
+    r = t.view(b, s, n_head, -1).permute(0, 2, 1, 3)
+    return r
+    
+
 def cache_slice(st, ed):
     return (slice(None), slice(None), slice(st, ed))
