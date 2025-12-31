@@ -10,6 +10,7 @@ from typing import Tuple, Union, Optional, Any, Sequence, List
 
 import numpy as np
 import torch
+import ml_dtypes
 
 
 KB = 1 << 10
@@ -349,3 +350,10 @@ def bsH_to_bhsd(t:torch.Tensor,n_head:int):
 
 def cache_slice(st, ed):
     return (slice(None), slice(None), slice(st, ed))
+
+
+def bf16_torch_to_np(torch_data):
+    return torch_data.cpu().detach().view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
+
+def bf16_np_to_torch(np_data):
+    return torch.tensor(np_data.view(np.uint16)).view(torch.bfloat16)

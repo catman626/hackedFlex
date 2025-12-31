@@ -13,6 +13,8 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
+import ml_dtypes
+from flexllmgen.utils import bf16_np_to_torch, bf16_torch_to_np
 
 
 def element_size_of(element_dtype):
@@ -21,7 +23,8 @@ def element_size_of(element_dtype):
         torch.float16: 2,
         torch.bfloat16: 2,
         np.float32: 4,
-        np.float16: 2
+        np.float16: 2,
+        ml_dtypes.bfloat16: 2
     }
     return element_size_dict[element_dtype]
 
@@ -41,6 +44,7 @@ class QwenConfig :
     bos_token_id = 151643
     eos_token_id = 151643
     pad_token_id = 151643
+    # dtype = ml_dtypes.bfloat16
     dtype = np.float32
 
     def model_bytes(self) -> int:
@@ -163,14 +167,10 @@ def convert_qwen_weights(model_name, path):
             param_path = os.path.join(seperated_weight_dir, name)
             with open(param_path, "wb") as f:
                 np.save(f, param.cpu().detach().to(torch.float32).numpy())
-
+                # np.save(f, bf16_torch_to_np(param))
     
             with open("parameter_names.txt", "+a") as f:
                 f.write(f"{name}\n")
-            # shared embedding
-            # if "decoder.embed_tokens.weight" in name:
-            #     shutil.copy(param_path, param_path.replace(
-            #         "decoder.embed_tokens.weight", "lm_head.weight"))
 
     seperated_weights = os.listdir(seperated_weight_dir)
     for w in seperated_weights:
