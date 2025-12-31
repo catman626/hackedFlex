@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+from flash_attn import flash_attn_func
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes, expand_block_idx, ValueHolder, num_block, 
@@ -197,8 +198,8 @@ class TorchTensor:
 
         self.shape = shape
         self.dtype = dtype
-        self.data = data
-        self.device = device
+        self.data:torch.Tensor= data
+        self.device:TorchDevice= device
 
         # Whether delete the file when the tensor is deleted
         self.delete_file = True
@@ -515,6 +516,7 @@ class TorchDevice:
 
     def out_proj(self, h, w_o):
 
+
         h = F.linear(h.data, w_o.data)
 
         return TorchTensor.create_from_torch(h, self)
@@ -538,29 +540,22 @@ class TorchDevice:
         
         if not enable_sparse:
             attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            
+
             # attn_out = q
             summary = None
             # bhsd -> bshd -> bsH
             attn_out = bhsd_to_bsH(attn_out)
         else:
-            last_q = q[:, :, -block_size:]
-            k1 = torch.repeat_interleave(k, n_qhead//n_kvhead, dim=1)
-            attn_score = torch.matmul(last_q, k1.transpose(2, 3))
-            n_sample_kv = s//10
+            from flexllmgen.sparse import block_sparse_attention
+            attn_out = block_sparse_attention(q.to(torch.bfloat16), 
+                                              repeat_interleave(k.to(torch.bfloat16), n_qhead, n_kvhead), 
+                                              repeat_interleave(v.to(torch.bfloat16), n_qhead, n_kvhead), 
+                                              top_k=s//block_size//10)
+            
+            attn_out = bhsd_to_bsH(attn_out.to(torch.float32))
 
-            q = q * (head_dim ** -0.5)
-            sparse_attn_score = torch.matmul(q, k1[:,:,-n_sample_kv:].transpose(2,3)    ) 
-
-            # (b, h, s, k)
-            attn_weight = torch.softmax(sparse_attn_score, dim=-1)
-
-            # (b, h, s, k) * (b, h, k, d) -> (b, h, s, d)
-            v1 = repeat_interleave(v[:, :, -n_sample_kv:], n_qhead, n_kvhead)
-
-            attn_out = torch.matmul(attn_weight, v1)
-
-            attn_out = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
-
+            # build summary
             tail_len = tail_length(s, block_size)
             n_blk = num_block(s, block_size)
             summary = k[:,:,:-tail_len].reshape(b, n_kvhead, n_blk, block_size, head_dim).mean(dim=-2)
@@ -636,6 +631,25 @@ class TorchDevice:
                 TorchTensor.create_from_torch(v, self), \
                 summary_ret, idx
        
+    def _block_attn(self, q, k, v, block_size, n_qhead, n_kvhead, head_dim, s):
+        last_q = q[:, :, -block_size:]
+        k1 = torch.repeat_interleave(k, n_qhead//n_kvhead, dim=1)
+        attn_score = torch.matmul(last_q, k1.transpose(2, 3))
+        n_sample_kv = s//10
+
+        q = q * (head_dim ** -0.5)
+        sparse_attn_score = torch.matmul(q, k1[:,:,-n_sample_kv:].transpose(2,3)    ) 
+
+        # (b, h, s, k)
+        attn_weight = torch.softmax(sparse_attn_score, dim=-1)
+
+        # (b, h, s, k) * (b, h, k, d) -> (b, h, s, d)
+        v1 = repeat_interleave(v[:, :, -n_sample_kv:], n_qhead, n_kvhead)
+
+        attn_out = torch.matmul(attn_weight, v1)
+
+        attn_out = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
+
     def _summary(self, k, block_size, new_k=None, block_range=None):
         """ k, v: (s, b*h, d) 
             return torch.Tensor"""
@@ -757,6 +771,8 @@ class TorchDevice:
 
         # attention-core
         attn_output = F.scaled_dot_product_attention(q_pos, k_pos, v, attn_mask=mask, enable_gqa=True)
+        attn_output = flash_attn_func(q, k, v)
+        
         # attn_output = fi.
 
         dump_hidden(attn_output, "sdpa", layerno)   # in shape (b, head, s, h)
@@ -1387,7 +1403,7 @@ class TorchDevice:
         """
         # dummy
         n_qhead, n_kvhead = n_head
-        return bsH_to_bhsd(h, n_qhead),bsH_to_bhsd(h, n_qhead),bsH_to_bhsd(h, n_qhead)
+        # return bsH_to_bhsd(h, n_qhead),bsH_to_bhsd(h, n_qhead),bsH_to_bhsd(h, n_qhead)
         
         hidden =  rms_layernorm(h, w_ln)
         cos, sin = position_embed

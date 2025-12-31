@@ -559,6 +559,7 @@ class QKVProj(TransformerComponent):
         # print(f" >>> step-{i} layer-{self.layer_id} proj-store-cache: {id(cache_home)}")
         k_home, v_home, k_summary_home, idx= cache_home.val
         k_new, v_new, k_summary = cache_write_buf.pop()
+        assert k_new.shape[1] == self.config.num_key_value_heads
         
         # if i == self.task.gen_len - 1:  # last token, no need to store cache
         #     return
@@ -598,7 +599,7 @@ class QKVProj(TransformerComponent):
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 position_embeddings, cache_write_buf, i, k):
         """ proj-forward """
-        # print(f" >>> step-{i},layer-{self.layer_id},batch-{k} proj-forward")
+        print(f" >>> step-{i},layer-{self.layer_id},batch-{k} proj-forward")
         donate = [False] * (1+1+1+7+2)
         # 0:hidden, 1:mask, 2:pos_embd, 345678 qkv_wb, 9 w_ln, 10-11 tail_kv
         
