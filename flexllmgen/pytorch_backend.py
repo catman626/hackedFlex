@@ -289,11 +289,12 @@ def apply_rope(x: torch.Tensor, position_embedding: tuple[torch.Tensor, torch.Te
     # sin, cos in shape (sed_len , hidden_dim)
     # x might in shape (bs, seq_len, head, hidden_dim) : unsqueeze_dim = 1
     #               or (bs, head, seq, hidden_dim):      unsqueeze_dim = 0
+    dtype0 = x.dtype
     cos, sin = position_embedding
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     x_embed  = (x * cos) + (rotate_half(x) * sin)
-    return x_embed
+    return x_embed.to(dtype0)
 
 class TorchDevice:
     """Wrap tensor and computation APIs of a single CPU or GPU."""
@@ -515,8 +516,7 @@ class TorchDevice:
         return k_cache, v_cache
 
     def out_proj(self, h, w_o):
-
-
+        assert h.data.dtype == torch.bfloat16
         h = F.linear(h.data, w_o.data)
 
         return TorchTensor.create_from_torch(h, self)
@@ -540,7 +540,7 @@ class TorchDevice:
         
         if not enable_sparse:
             attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
-            
+            assert attn_out.dtype == torch.bfloat16
 
             # attn_out = q
             summary = None
@@ -553,7 +553,7 @@ class TorchDevice:
                                               repeat_interleave(v.to(torch.bfloat16), n_qhead, n_kvhead), 
                                               top_k=s//block_size//10)
             
-            attn_out = bhsd_to_bsH(attn_out.to(torch.float32))
+            attn_out = bhsd_to_bsH(attn_out)
 
             # build summary
             tail_len = tail_length(s, block_size)
@@ -1415,6 +1415,8 @@ class TorchDevice:
         q = F.linear(hidden, w_q, bias=b_q) 
         k = F.linear(hidden, w_k, bias=b_k)
         v = F.linear(hidden, w_v, bias=b_v)
+
+
 
         # shape: (b, s, n_head, head_dim) -> (b, head, s, head_dim)
         q = q.view(b, s, n_qhead,  head_dim).transpose(1,2)

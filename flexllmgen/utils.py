@@ -73,12 +73,14 @@ np_dtype_to_torch_dtype = {
     np.int64: torch.int64,
     bool: torch.bool,
     float: torch.float32,
+    ml_dtypes.bfloat16: torch.bfloat16
 }
 
 torch_dtype_to_np_dtype = {
     torch.float16: np.float16, torch.float32: np.float32,
     torch.uint8: np.uint8, torch.int8: np.int8, torch.int32: np.int32,
     torch.int64: np.int64, torch.bool: bool,
+    torch.bfloat16: ml_dtypes.bfloat16
 }
 
 torch_dtype_to_num_bytes = {

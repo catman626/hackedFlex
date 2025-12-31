@@ -44,8 +44,8 @@ class QwenConfig :
     bos_token_id = 151643
     eos_token_id = 151643
     pad_token_id = 151643
-    # dtype = ml_dtypes.bfloat16
-    dtype = np.float32
+    dtype = ml_dtypes.bfloat16
+    # dtype = np.float32
 
     def model_bytes(self) -> int:
         h, n_layers = self.hidden_size, self.num_hidden_layers
@@ -162,12 +162,12 @@ def convert_qwen_weights(model_name, path):
     for safetensor_file in tqdm(safetensor_files, desc="Convert format"):
         state = load_file(safetensor_file)
         for name, param in tqdm(state.items(), leave=False):
-            name = name.replace("model.", "")
-            # name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
-            param_path = os.path.join(seperated_weight_dir, name)
+            name        = name.replace("model.", "")
+            param_path  = os.path.join(seperated_weight_dir, name)
+
             with open(param_path, "wb") as f:
-                np.save(f, param.cpu().detach().to(torch.float32).numpy())
-                # np.save(f, bf16_torch_to_np(param))
+                # np.save(f, param.cpu().detach().to(torch.float32).numpy())
+                np.save(f, bf16_torch_to_np(param))
     
             with open("parameter_names.txt", "+a") as f:
                 f.write(f"{name}\n")

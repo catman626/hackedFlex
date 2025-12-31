@@ -923,7 +923,6 @@ class ShiftedTransformerLayer:
         
         attn_cache_write_buf, proj_cache_write_buf = ValueHolder(), ValueHolder()
 
-
         self.attn_after_proj.forward(hidden, 
                                      attn_cache_buf, attn_read_buf, 
                                      attention_mask, position_embedding, 
