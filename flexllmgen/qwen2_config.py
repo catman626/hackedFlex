@@ -73,7 +73,22 @@ class QwenConfig :
         # 隐藏状态张量（batch×seq×hidden）× 字节数
         element_size = np.dtype(self.dtype).itemsize
         return batch_size * seq_len * self.hidden_size * element_size_of(self.dtype)
+    
+    def estimate_peak_mem(self,  policy, prompt_len) ->int:
+        batch_size = policy.gpu_batch_size
+        weights = self.model_bytes()
+        
+        cache = self.cache_bytes(batch_size, policy.prompt_len)\
+            * policy.cache_gpu_percent / 100 \
+                * 2     # 2 gpu-block active in prefill
+        
+        hidden = self.hidden_bytes(batch_size, policy.prompt_len)
 
+        static_peak = weights + cache + hidden
+        
+        return static_peak
+    
+    
 def extract_name_from_path(pathname):
     import re
     pattern = r"models--(.*?)--(.*?)/"

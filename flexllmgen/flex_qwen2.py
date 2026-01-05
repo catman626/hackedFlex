@@ -16,7 +16,7 @@ from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, Torch
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
-    read_benchmark_log, expand_block_idx, num_block, tail_length, cache_slice)
+    read_benchmark_log, expand_block_idx, num_block, tail_length, cache_slice, check_idx)
 from flexllmgen.qwen2_config import QwenConfig, get_qwen_config, convert_qwen_weights
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.sparse import SparseConfig
@@ -24,6 +24,7 @@ from flexllmgen.sparse import SparseConfig
 from flexllmgen.flex_opt import init_weight_list, get_compact_test_inputs, get_file_inputs, get_test_inputs, get_filename
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -506,7 +507,7 @@ class QKVProj(TransformerComponent):
             # prefill
             return
         
-        # print(f" >>> step {i} layer {self.layer_id} proj load cache: {id(cache_home)}")
+        print(f" >>> step {i} layer {self.layer_id} proj load cache: {id(cache_home)}")
         k_home, v_home, summary_home, idx_home = cache_home.val
 
         context_len = self._context_len(i)
@@ -556,7 +557,7 @@ class QKVProj(TransformerComponent):
         """proj-store-cache"""
         # shape: (s, b * n_head, head_dim)
         # current impl load&store whole summary
-        # print(f" >>> step-{i} layer-{self.layer_id} proj-store-cache: {id(cache_home)}")
+        print(f" >>> step-{i} layer-{self.layer_id} proj-store-cache: {id(cache_home)}")
         k_home, v_home, k_summary_home, idx= cache_home.val
         k_new, v_new, k_summary = cache_write_buf.pop()
         assert k_new.shape[1] == self.config.num_key_value_heads
@@ -577,12 +578,9 @@ class QKVProj(TransformerComponent):
         # store summary
         if k_summary is not None:
             context_len = self._context_len(i)
-            
             block_size = self.policy.sparse_config.block_size
-            num_blk = context_len // block_size - 1
+            num_blk = num_block(context_len ,block_size )
 
-            # print(f" >>> context_len: {self._context_len(i)}")
-            # print(f" >>> summary shape: {k_summary.shape}") 
             if i == 0 or not self._sparse_stage(i-1):
                 assert num_blk == k_summary.shape[2]
                 dst_idx = slice(0, num_blk)
@@ -593,13 +591,12 @@ class QKVProj(TransformerComponent):
                                             dst_idx ), 
                          k_summary, 
                          None)
-        # store idx
         
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                position_embeddings, cache_write_buf, i, k):
+                position_embeddings, cache_write_buf, i, kno):
         """ proj-forward """
-        print(f" >>> step-{i},layer-{self.layer_id},batch-{k} proj-forward")
+        print(f" >>> step-{i},layer-{self.layer_id},batch-{kno} proj-forward")
         donate = [False] * (1+1+1+7+2)
         # 0:hidden, 1:mask, 2:pos_embd, 345678 qkv_wb, 9 w_ln, 10-11 tail_kv
         
@@ -608,7 +605,7 @@ class QKVProj(TransformerComponent):
         n_qhead = self.config.num_attention_heads
         n_kvhead = self.config.num_key_value_heads
 
-        if k == self.policy.num_gpu_batches - 1:
+        if kno == self.policy.num_gpu_batches - 1:
             (( w_q,  donate[3]), (b_q, donate[4]), 
             (  w_k, donate[5]), (b_k, donate[6]),
             (  w_v, donate[7]), (b_v, donate[8]),
@@ -647,15 +644,18 @@ class QKVProj(TransformerComponent):
             
             assert not (self._sparse_stage(i) and idx is None)
             if idx is not None:
-            # idxhome:(b, head, k) 
+                # idxhome:(b, head, k) 
+                dump_hidden(idx.data, f"idx-{i}-{self.layer_id}-{kno}")
+                check_idx(idx.data, context_len)
                 window_size = idx.data.shape[-1]
                 n_kvhead = self.config.num_attention_heads
-                dst_idx = (slice(None), slice(None), slice(window_size))
-                src_idx = (slice(None), slice(None), 0) 
+                dst_idx = (slice(None), slice(None), slice(0, window_size))
+                # src_idx = (slice(None), slice(None), 0) 
                 if idx_cnt.val is not None:
                     idx_cnt.clear()
                 idx_cnt.store(idx.shape[2])
-                general_copy(idx_home, dst_idx, idx, src_idx)
+                print(f" >>> idx_cnt: {idx_cnt.val}")
+                general_copy(idx_home, dst_idx, idx, None)
 
             cache_write_buf.store((k, v, new_summary))
 
@@ -704,7 +704,7 @@ class AttentionAfterProj(TransformerComponent):
         """ attn-load-cache"""
         if i == 0:  # prefill, no cache
             return
-        # print(f" >>> step-{i},layer-{self.layer_id} attn-load-cache: {id(cache_home)}")
+        print(f" >>> step-{i},layer-{self.layer_id} attn-load-cache: {id(cache_home)}")
         # assert isinstance(cache_home, ValueHolder)
         k_home, v_home, summary, (idx_home, idx_cnt) = cache_home.val
         
@@ -730,7 +730,7 @@ class AttentionAfterProj(TransformerComponent):
             indices = idx.data[:, :, :idx_cnt]
 
             block_size = self.policy.sparse_config.block_size
-            n_tail_cache =  context_len% block_size + block_size
+            n_tail_cache =  tail_length(context_len, block_size)
 
             # context_len-1 since new_k wont be load
             tail_idx = (slice(None), slice(None), slice(context_len-n_tail_cache, context_len-1))
@@ -741,12 +741,11 @@ class AttentionAfterProj(TransformerComponent):
                     k_home.smart_copy(dst, tail_idx),
                     v_home.smart_copy(dst, tail_idx)    )
             )
-
     
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
         position_embeddings, cache_write_buf, i, k):
         """ attn-forward"""
-        # print(f" >>> step-{i},layer-{self.layer_id},batch-{k} attn-forward")
+        print(f" >>> step-{i},layer-{self.layer_id},batch-{k} attn-forward")
         donate = [False] * (1+1+4)
 
         if k == self.policy.num_gpu_batches - 1:
@@ -942,7 +941,7 @@ class ShiftedTransformerLayer:
         attn_cache_write_buf, proj_cache_write_buf = cache_write_buf.pop()
         attn_cache_home, proj_cache_home = cache_home.val
         
-        # print(f" >>> step{i}, layer{self.layer_id}, store cache")
+        print(f" >>> step{i}, layer{self.layer_id}, store cache")
         self.attn_after_proj.store_cache(attn_cache_home, attn_cache_write_buf, i)
         self.qkv_proj.store_cache(proj_cache_home, proj_cache_write_buf, i)
 
@@ -1603,7 +1602,8 @@ class QwenLM:
 
         # Generate
         for i in range(self.execute_gen_len):
-            print(f" >>> step-{i}") 
+            if i % 10 == 0 or 1:
+                print(f" >>> step-{i}") 
             timers("generate").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
@@ -1620,6 +1620,9 @@ class QwenLM:
 
                     self.compute_layer(i, j, k)
                     self.sync()
+
+                mem_peak = torch.cuda.max_memory_allocated("cuda")
+                print(f" >>> mem peak: {mem_peak//10**9} GB")
             timers("generate").stop()
         # Epilogue
         # self.store_hidden(
@@ -1930,6 +1933,7 @@ def predict_mem_and_log(qwen_config, num_prompts, prompt_len, gen_len):
     context_len = prompt_len + gen_len 
     cache_size = qwen_config.cache_bytes(num_prompts, context_len)
     hidden_size = qwen_config.hidden_bytes(num_prompts, context_len)
+    
     print(f" >>> genlen: {context_len}, ")
     print(f"model size: {qwen_config.model_bytes()/GB:.3f} GB, "
     f"cache size: {cache_size/GB:.3f} GB, "
@@ -2000,6 +2004,7 @@ def run_flexllmgen(args):
     total_throughput = num_generated_tokens / total_latency
     _, gpu_peak_mem = env.gpu.mem_stats()
     _, cpu_peak_mem = env.cpu.mem_stats()
+    
 
     if DUMMY_WEIGHT not in args.path:
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)

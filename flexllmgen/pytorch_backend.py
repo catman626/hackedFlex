@@ -23,7 +23,7 @@ general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
 global_disk_device = None
 
-DUMP_HIDDEN = False
+DUMP_HIDDEN = True
 # DUMP_HIDDEN = True
 DUMP_VERBOSE = False
 
@@ -138,6 +138,8 @@ def index_into(data:torch.Tensor, idx, ensure_view=False):
         selected = data.repeat_interleave(n_qhead//n_kvhead, dim=1)\
                         .gather(dim=-2, 
                                 index=idx.unsqueeze(-1).expand(-1,-1,-1,head_dim))
+
+        print(f" >>> using gather index")
 
     elif isinstance(idx, tuple):
         selected = data[idx] 
@@ -285,7 +287,9 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def apply_rope(x: torch.Tensor, position_embedding: tuple[torch.Tensor, torch.Tensor], unsqueeze_dim = 1 ) -> torch.Tensor:
+def apply_rope(x: torch.Tensor, 
+               position_embedding: tuple[torch.Tensor, torch.Tensor], 
+               unsqueeze_dim = 1 ) -> torch.Tensor:
     # sin, cos in shape (sed_len , hidden_dim)
     # x might in shape (bs, seq_len, head, hidden_dim) : unsqueeze_dim = 1
     #               or (bs, head, seq, hidden_dim):      unsqueeze_dim = 0
@@ -548,11 +552,11 @@ class TorchDevice:
             attn_out = bhsd_to_bsH(attn_out)
         else:
             from flexllmgen.sparse import block_sparse_attention
-            attn_out = block_sparse_attention(q.to(torch.bfloat16), 
-                                              repeat_interleave(k.to(torch.bfloat16), n_qhead, n_kvhead), 
-                                              repeat_interleave(v.to(torch.bfloat16), n_qhead, n_kvhead), 
+            attn_out = block_sparse_attention(q, 
+                                              repeat_interleave(k, n_qhead, n_kvhead), 
+                                              repeat_interleave(v, n_qhead, n_kvhead), 
                                               top_k=s//block_size//10)
-            
+            # attn_out = q
             attn_out = bhsd_to_bsH(attn_out)
 
             # build summary
@@ -622,9 +626,13 @@ class TorchDevice:
             topk = max(num_blk//5, 1)
             # (b, h, k)
             top_weight, top_idx = torch.topk(blk_attn_score, num_blk // 5, dim=-1, sorted=False)
+
+            top_idx = top_idx.squeeze(dim=2)
             idx = expand_block_idx(top_idx, block_size)
+
             check_idx(idx)
             idx = TorchTensor.create_from_torch(idx, self)
+            
 
         return  TorchTensor.create_from_torch(q, self), \
                 TorchTensor.create_from_torch(k, self),  \

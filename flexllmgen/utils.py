@@ -307,7 +307,7 @@ def read_benchmark_log(filename):
         total_latency, total_throughput,
     )
 
-def expand_block_idx(block_idx, block_size, return_form="BHN"):
+def expand_block_idx(block_idx, block_size, return_form="BHN")->torch.tensor:
     """ 
     block_idx -> token-idx
     block_idx : (*, topk) -> (*, expanded_tokens) """
@@ -359,3 +359,9 @@ def bf16_torch_to_np(torch_data):
 
 def bf16_np_to_torch(np_data):
     return torch.tensor(np_data.view(np.uint16)).view(torch.bfloat16)
+
+def check_idx(idx:torch.Tensor, s):
+    mn = idx.min().item()
+    mx = idx.max().item()
+
+    assert mn >= 0 and mx <= s

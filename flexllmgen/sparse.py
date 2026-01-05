@@ -194,7 +194,7 @@ def block_sparse_attention(
     seqlens = torch.tensor([context_size], dtype=torch.int32, device=query.device)
     sm_scale = head_dim ** -0.5
     block_index = _build_block_index(query, key, top_k, block_size_N, block_size_N)
-    print(f" >>> shape of block_index: {block_index.shape}")
+
     out = _triton_block_sparse_attention(query, key, value, seqlens, block_index, sm_scale, block_size_M, block_size_N)
     return out[..., :context_size, :]
     
