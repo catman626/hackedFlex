@@ -332,7 +332,7 @@ class TorchDevice:
             pin_memory = False
         dtype = np_dtype_to_torch_dtype[dtype]
         # dtype = torch.bfloat16
-        data = torch.empty(shape, dtype=dtype, pin_memory=pin_memory, device=self.dev)
+        data = torch.full(shape, -42, dtype=dtype, pin_memory=pin_memory, device=self.dev)
         return TorchTensor.create_from_torch(data, self, name=name)
 
     def delete(self, tensor):
@@ -1710,6 +1710,8 @@ def copy_worker_func(queue, cuda_id):
     torch.cuda.set_device(cuda_id)
 
     cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+    cpu_buf_int = torch.empty((10000000,), dtype=torch.int32, pin_memory=True)
+
     copy_stream = torch.cuda.Stream()
 
     with torch.cuda.stream(copy_stream):
@@ -1727,9 +1729,15 @@ def copy_worker_func(queue, cuda_id):
                 dst.device.device_type == DeviceType.CUDA):
                 # Use a pinned cpu buffer as a relay
                 size = np.prod(src_data.shape)
-                tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+                
+                tmp_cpu_buf = cpu_buf[:size].view(src_data.shape) \
+                    if torch.is_floating_point(src_data) \
+                        else cpu_buf_int[:size].view(src_data.shape)
                 tmp_cpu_buf.copy_(src_data)
+                # print(f" >>>>>> tmp_cpu_buf.min().item(): {tmp_cpu_buf.min().item()}")
+                # print(f" >>>>>> src_data.min().item(): {src_data.min().item()}")
                 dst_data.copy_(tmp_cpu_buf)
+                # print(f" >>>>>> dst_data.min().item(): {dst_data.min().item()}")
             else:
                 dst_data.copy_(src_data)
 

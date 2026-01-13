@@ -361,7 +361,14 @@ def bf16_np_to_torch(np_data):
     return torch.tensor(np_data.view(np.uint16)).view(torch.bfloat16)
 
 def check_idx(idx:torch.Tensor, s):
+    assert len(idx.shape) == 3  
     mn = idx.min().item()
     mx = idx.max().item()
 
     assert mn >= 0 and mx <= s
+
+def catlog(log_content, tag=None):
+    if tag in [
+        "step"
+    ] :
+        print(log_content)

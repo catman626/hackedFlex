@@ -16,7 +16,7 @@ from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, Torch
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
-    read_benchmark_log, expand_block_idx, num_block, tail_length, cache_slice, check_idx)
+    read_benchmark_log, expand_block_idx, num_block, tail_length, cache_slice, check_idx, catlog)
 from flexllmgen.qwen2_config import QwenConfig, get_qwen_config, convert_qwen_weights
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.sparse import SparseConfig
@@ -507,7 +507,7 @@ class QKVProj(TransformerComponent):
             # prefill
             return
         
-        print(f" >>> step {i} layer {self.layer_id} proj load cache: {id(cache_home)}")
+        # print(f" >>> step {i} layer {self.layer_id} proj load cache: {id(cache_home)}")
         k_home, v_home, summary_home, idx_home = cache_home.val
 
         context_len = self._context_len(i)
@@ -557,7 +557,7 @@ class QKVProj(TransformerComponent):
         """proj-store-cache"""
         # shape: (s, b * n_head, head_dim)
         # current impl load&store whole summary
-        print(f" >>> step-{i} layer-{self.layer_id} proj-store-cache: {id(cache_home)}")
+        # print(f" >>> step-{i} layer-{self.layer_id} proj-store-cache: {id(cache_home)}")
         k_home, v_home, k_summary_home, idx= cache_home.val
         k_new, v_new, k_summary = cache_write_buf.pop()
         assert k_new.shape[1] == self.config.num_key_value_heads
@@ -596,7 +596,7 @@ class QKVProj(TransformerComponent):
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 position_embeddings, cache_write_buf, i, kno):
         """ proj-forward """
-        print(f" >>> step-{i},layer-{self.layer_id},batch-{kno} proj-forward")
+        # print(f" >>> step-{i},layer-{self.layer_id},batch-{kno} proj-forward")
         donate = [False] * (1+1+1+7+2)
         # 0:hidden, 1:mask, 2:pos_embd, 345678 qkv_wb, 9 w_ln, 10-11 tail_kv
         
@@ -624,7 +624,7 @@ class QKVProj(TransformerComponent):
 
         if i == 0:
             q, k, v, k_summary = self.compute.prefill_proj(h, 
-                                                               None, position_embed, 
+                                                            None, position_embed, 
                                                                w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
                                                                (n_qhead, n_kvhead), 
                                                                enable_sparse=self._sparse_stage(i), 
@@ -647,18 +647,15 @@ class QKVProj(TransformerComponent):
                 # idxhome:(b, head, k) 
                 dump_hidden(idx.data, f"idx-{i}-{self.layer_id}-{kno}")
                 check_idx(idx.data, context_len)
-                window_size = idx.data.shape[-1]
-                n_kvhead = self.config.num_attention_heads
-                dst_idx = (slice(None), slice(None), slice(0, window_size))
-                # src_idx = (slice(None), slice(None), 0) 
+                select_cnt = idx.data.shape[-1]
+                dst_idx = (slice(None), slice(None), slice(0, select_cnt))
                 if idx_cnt.val is not None:
                     idx_cnt.clear()
-                idx_cnt.store(idx.shape[2])
-                print(f" >>> idx_cnt: {idx_cnt.val}")
+                idx_cnt.store(select_cnt)
+                
                 general_copy(idx_home, dst_idx, idx, None)
 
             cache_write_buf.store((k, v, new_summary))
-
 
 class AttentionAfterProj(TransformerComponent):
     def __init__(self, config, env, policy, layer_id):
@@ -726,8 +723,13 @@ class AttentionAfterProj(TransformerComponent):
             idx_cnt = idx_cnt.pop()
             
             idx, _= idx_home.smart_copy(k_home.device)
-            
-            indices = idx.data[:, :, :idx_cnt]
+            idx = idx.data
+            # torch.cuda.synchronize()
+            # idx = idx.data.to(k_home.device.dev)
+            indices = idx[:, :, :idx_cnt]
+
+            # print(f" >>> idx-cnt: {idx_cnt}") 
+            # indices = idx.data[:, :, :idx_cnt]
 
             block_size = self.policy.sparse_config.block_size
             n_tail_cache =  tail_length(context_len, block_size)
@@ -745,7 +747,7 @@ class AttentionAfterProj(TransformerComponent):
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
         position_embeddings, cache_write_buf, i, k):
         """ attn-forward"""
-        print(f" >>> step-{i},layer-{self.layer_id},batch-{k} attn-forward")
+        catlog(f" >>> step-{i},layer-{self.layer_id},batch-{k} attn-forward", "steps")
         donate = [False] * (1+1+4)
 
         if k == self.policy.num_gpu_batches - 1:
@@ -1621,8 +1623,8 @@ class QwenLM:
                     self.compute_layer(i, j, k)
                     self.sync()
 
-                mem_peak = torch.cuda.max_memory_allocated("cuda")
-                print(f" >>> mem peak: {mem_peak//10**9} GB")
+                # mem_peak = torch.cuda.max_memory_allocated("cuda")
+                # print(f" >>> mem peak: {mem_peak//10**9} GB")
             timers("generate").stop()
         # Epilogue
         # self.store_hidden(
