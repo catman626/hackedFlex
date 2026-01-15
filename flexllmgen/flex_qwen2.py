@@ -132,7 +132,7 @@ def precompute_rope_freqs(dim: int, max_seq_len: int, theta: float, device) :
     
     concat_inv_freq = torch.concat([inv_freq, inv_freq], dim=-1)
     freqs = torch.outer(seq, concat_inv_freq)
-    return torch.cos(freqs), torch.sin(freqs)
+    return torch.cos(freqs).to(torch.bfloat16), torch.sin(freqs).to(torch.bfloat16)
 
 def eager_attention_core(q, k, v , seq_len, head_dim, device):
     casual_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
@@ -507,7 +507,7 @@ class QKVProj(TransformerComponent):
             # prefill
             return
         
-        # print(f" >>> step {i} layer {self.layer_id} proj load cache: {id(cache_home)}")
+        catlog(f" >>> step {i} layer {self.layer_id} proj load cache: {id(cache_home)}", "block")
         k_home, v_home, summary_home, idx_home = cache_home.val
 
         context_len = self._context_len(i)
@@ -557,7 +557,7 @@ class QKVProj(TransformerComponent):
         """proj-store-cache"""
         # shape: (s, b * n_head, head_dim)
         # current impl load&store whole summary
-        # print(f" >>> step-{i} layer-{self.layer_id} proj-store-cache: {id(cache_home)}")
+        catlog(f" >>> step-{i} layer-{self.layer_id} proj-store-cache: {id(cache_home)}", "block")
         k_home, v_home, k_summary_home, idx= cache_home.val
         k_new, v_new, k_summary = cache_write_buf.pop()
         assert k_new.shape[1] == self.config.num_key_value_heads
@@ -596,7 +596,7 @@ class QKVProj(TransformerComponent):
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 position_embeddings, cache_write_buf, i, kno):
         """ proj-forward """
-        # print(f" >>> step-{i},layer-{self.layer_id},batch-{kno} proj-forward")
+        catlog(f" >>> step-{i},layer-{self.layer_id},batch-{kno} proj-forward", tag="block")
         donate = [False] * (1+1+1+7+2)
         # 0:hidden, 1:mask, 2:pos_embd, 345678 qkv_wb, 9 w_ln, 10-11 tail_kv
         
@@ -701,7 +701,7 @@ class AttentionAfterProj(TransformerComponent):
         """ attn-load-cache"""
         if i == 0:  # prefill, no cache
             return
-        print(f" >>> step-{i},layer-{self.layer_id} attn-load-cache: {id(cache_home)}")
+        catlog(f" >>> step-{i},layer-{self.layer_id} attn-load-cache: {id(cache_home)}", "block")
         # assert isinstance(cache_home, ValueHolder)
         k_home, v_home, summary, (idx_home, idx_cnt) = cache_home.val
         
@@ -728,9 +728,6 @@ class AttentionAfterProj(TransformerComponent):
             # idx = idx.data.to(k_home.device.dev)
             indices = idx[:, :, :idx_cnt]
 
-            # print(f" >>> idx-cnt: {idx_cnt}") 
-            # indices = idx.data[:, :, :idx_cnt]
-
             block_size = self.policy.sparse_config.block_size
             n_tail_cache =  tail_length(context_len, block_size)
 
@@ -747,7 +744,7 @@ class AttentionAfterProj(TransformerComponent):
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
         position_embeddings, cache_write_buf, i, k):
         """ attn-forward"""
-        catlog(f" >>> step-{i},layer-{self.layer_id},batch-{k} attn-forward", "steps")
+        catlog(f" >>> step-{i},layer-{self.layer_id},batch-{k} attn-forward", "block")
         donate = [False] * (1+1+4)
 
         if k == self.policy.num_gpu_batches - 1:
@@ -943,7 +940,7 @@ class ShiftedTransformerLayer:
         attn_cache_write_buf, proj_cache_write_buf = cache_write_buf.pop()
         attn_cache_home, proj_cache_home = cache_home.val
         
-        print(f" >>> step{i}, layer{self.layer_id}, store cache")
+        catlog(f" >>> step{i}, layer{self.layer_id}, store cache", "block")
         self.attn_after_proj.store_cache(attn_cache_home, attn_cache_write_buf, i)
         self.qkv_proj.store_cache(proj_cache_home, proj_cache_write_buf, i)
 
@@ -1272,7 +1269,6 @@ class QwenLM:
             if i == self.execute_gen_len:
                 return
 
-        # print(f" >>> load cache: ({i},{j},{k})")
         # Load from cache_home to cache_read_buf
         if overlap:
             with torch.cuda.stream(self.load_cache_stream):
@@ -1605,7 +1601,7 @@ class QwenLM:
         # Generate
         for i in range(self.execute_gen_len):
             if i % 10 == 0 or 1:
-                print(f" >>> step-{i}") 
+                catlog(f" >>> step-{i}", "step") 
             timers("generate").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
@@ -1735,7 +1731,7 @@ class QwenLM:
 
         # Generate
         for i in range(self.execute_gen_len):
-            print(f" >>> step-{i}")
+            catlog(f" >>> step-{i}", "step")
             timers("generate").start()
             self.update_attention_mask(i, 0)
             self.update_position_embedding(i, 0)
@@ -1765,7 +1761,7 @@ class QwenLM:
 
         # Generate
         for i in range(self.execute_gen_len):
-            print(f" >>> step-{i}")
+            catlog(f" >>> step-{i}", "step")
             timers("generate").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)

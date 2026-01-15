@@ -369,6 +369,7 @@ def check_idx(idx:torch.Tensor, s):
 
 def catlog(log_content, tag=None):
     if tag in [
-        "step"
+        "step",
+        # "block",
     ] :
         print(log_content)

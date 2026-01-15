@@ -23,7 +23,7 @@ general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
 global_disk_device = None
 
-DUMP_HIDDEN = True
+DUMP_HIDDEN = False
 # DUMP_HIDDEN = True
 DUMP_VERBOSE = False
 
@@ -139,7 +139,7 @@ def index_into(data:torch.Tensor, idx, ensure_view=False):
                         .gather(dim=-2, 
                                 index=idx.unsqueeze(-1).expand(-1,-1,-1,head_dim))
 
-        print(f" >>> using gather index")
+        # print(f" >>> using gather index")
 
     elif isinstance(idx, tuple):
         selected = data[idx] 
@@ -224,6 +224,11 @@ class TorchTensor:
         assert self.device is not None, "already deleted"
         if self.device.device_type == DeviceType.DISK:
             self.device.delete(self)
+        
+        # hacked
+        del self.data
+        #hackd 
+
         self.device = self.data = None
 
     def load_from_np(self, np_array):
@@ -278,7 +283,8 @@ class TorchTensor:
 
 def rms_layernorm(x, w):
     eps = 1e-6
-    rms = torch.sqrt(torch.mean(x **2, dim=-1, keepdim=True) + eps)
+    rms = torch.mean(x * x, dim=-1, keepdim=True)
+    rms = torch.sqrt(rms+eps)
     return w * (x / rms)
 
 def rotate_half(x):
@@ -297,7 +303,9 @@ def apply_rope(x: torch.Tensor,
     cos, sin = position_embedding
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    x_embed  = (x * cos) + (rotate_half(x) * sin)
+
+    rhalf = rotate_half(x)
+    x_embed  = (x * cos) + (rhalf * sin)
     return x_embed.to(dtype0)
 
 class TorchDevice:
@@ -538,8 +546,12 @@ class TorchDevice:
         sin = position_embed.data[1][:s]
 
         mask = attn_mask.data if attn_mask is not None else None
-        q, k, v = self._qkv_proj(h.data, mask, (cos, sin), 
-                                 w_q.data, b_q.data, w_k.data, b_k.data, w_v.data, b_v.data, w_ln.data,
+        h_in = h.data
+        h.delete()
+        q, k, v = self._qkv_proj(h_in, mask, (cos, sin), 
+                                 w_q.data, b_q.data, 
+                                 w_k.data, b_k.data, 
+                                 w_v.data, b_v.data, w_ln.data,
                                  n_head)
         
         if not enable_sparse:
@@ -1345,7 +1357,6 @@ class TorchDevice:
 
         b, s, h = inputs.shape
 
-        global mlp_layerno
 
         dump_hidden(inputs.data, "mlp-input", layerno)
 
@@ -1356,13 +1367,15 @@ class TorchDevice:
         gate = F.silu(gate, inplace=True)
         
         up = F.linear(norm, w_up.data, bias=None)
+        del norm
 
-        out = gate * up
+        # out = gate * up
+        out = up.mul_(gate)
+        del gate
         
         out = F.linear(out, w_down.data, bias=None)
-
-        out.add_(inputs.data)
-
+        
+        out = out.add_(inputs.data)
 
         if donate[0]: inputs.delete()
         
@@ -1402,7 +1415,7 @@ class TorchDevice:
     def __str__(self):
         return f"TorchDevice(name={self.name})"
 
-    def _qkv_proj(self, h, 
+    def _qkv_proj(self, hidden, 
                  attn_mask, position_embed, 
                  w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
                  n_head, return_form="bhsd"):
@@ -1410,21 +1423,19 @@ class TorchDevice:
             return: q,k,v in (b, h, s, d) 
         """
         # dummy
-        n_qhead, n_kvhead = n_head
-        # return bsH_to_bhsd(h, n_qhead),bsH_to_bhsd(h, n_qhead),bsH_to_bhsd(h, n_qhead)
-        
-        hidden =  rms_layernorm(h, w_ln)
         cos, sin = position_embed
         n_qhead, n_kvhead = n_head
-        b, s, h = h.shape
+        b, s, h = hidden.shape
         head_dim = h//n_qhead
+
+        # return bsH_to_bhsd(h, n_qhead),bsH_to_bhsd(h, n_qhead),bsH_to_bhsd(h, n_qhead)
+        
+        hidden =  rms_layernorm(hidden, w_ln)
 
         # shape: (b, s, h)
         q = F.linear(hidden, w_q, bias=b_q) 
         k = F.linear(hidden, w_k, bias=b_k)
         v = F.linear(hidden, w_v, bias=b_v)
-
-
 
         # shape: (b, s, n_head, head_dim) -> (b, head, s, head_dim)
         q = q.view(b, s, n_qhead,  head_dim).transpose(1,2)
@@ -1432,15 +1443,15 @@ class TorchDevice:
         v = v.view(b, s, n_kvhead, head_dim).transpose(1,2)
 
         # (b, head, s, d)
-        q_pos = apply_rope(q, (cos, sin), unsqueeze_dim=0)
-        k_pos = apply_rope(k, (cos, sin), unsqueeze_dim=0)
+        q = apply_rope(q, (cos, sin), unsqueeze_dim=0)
+        k = apply_rope(k, (cos, sin), unsqueeze_dim=0)
 
         if return_form == "bsH":
-            q_pos = bhsd_to_bsH(q_pos)
-            k_pos = bhsd_to_bsH(k_pos)
+            q = bhsd_to_bsH(q)
+            k = bhsd_to_bsH(k)
             v = bhsd_to_bsH(v)
 
-        return q_pos, k_pos, v 
+        return q, k, v 
 
 
 class TorchDisk:
