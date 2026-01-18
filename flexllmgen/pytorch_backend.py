@@ -138,18 +138,42 @@ def copy_indices_to_shape(indices:Tuple, src_shape):
         print(f" >>> idx type: {type(indices)}")
         raise NotImplementedError()
 
+def advanec_idx(data, idx):
+    # concat all selected idx all 
+    # data: (b, kv_head, s, hidden)
+    # idx:  (b, q_head, k)
+    b, kv_head, s, hidden = data.shape
+    q_head = idx.shape[1]
+
+    # 假设 q_head 是 kv_head 的整数倍（如 GQA）
+    group_size = q_head // kv_head
+
+    # 对每个 batch 和 q_head，映射到对应的 kv_head
+    head_mapping = torch.arange(q_head, device=data.device) // group_size  # (q_head,)
+    
+    b_idx = torch.arange(b, device=data.device).view(b, 1, 1)        # (b, 1, 1)
+    h_idx = head_mapping.view(1, q_head, 1)                         # (1, q_head, 1)
+    s_idx = idx                                                     # (b, q_head, k)
+
+    selected = data[b_idx, h_idx, s_idx, :]  # 自动广播，无需 expand
+
+    return selected
+
+def gather_idxer(data, idx):
+    n_kvhead, head_dim = data.shape[1], data.shape[-1]
+    n_qhead = idx.shape[1]
+        
+    selected = data.repeat_interleave(n_qhead//n_kvhead, dim=1)\
+                    .gather(dim=-2, 
+                            index=idx.unsqueeze(-1).expand(-1,-1,-1,head_dim))
+    return selected
+    
 def index_into(data:torch.Tensor, idx, ensure_view=False):
     if isinstance(idx, torch.Tensor):
-        # case of block sparse
+        # only case of block sparse
         assert not ensure_view 
-        n_kvhead, head_dim = data.shape[1], data.shape[-1]
-        n_qhead = idx.shape[1]
-        
-        selected = data.repeat_interleave(n_qhead//n_kvhead, dim=1)\
-                        .gather(dim=-2, 
-                                index=idx.unsqueeze(-1).expand(-1,-1,-1,head_dim))
-
-        # print(f" >>> using gather index")
+        with torch.profiler.record_function("gather-idx"):
+            selected = advanec_idx(data, idx)
 
     elif isinstance(idx, tuple):
         selected = data[idx] 

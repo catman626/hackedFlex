@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, List, Tuple, Union, List
-from transformers import Qwen2ForCausalLM, AutoTokenizer
+from transformers import  AutoTokenizer
 from safetensors.torch import load_file
 import os
 from flexllmgen.timer import timers
@@ -623,7 +623,8 @@ class QKVProj(TransformerComponent):
         block_size = self.policy.sparse_config.block_size
 
         if i == 0:
-            q, k, v, k_summary = self.compute.prefill_proj(h, 
+            with torch.profiler.record_function("prefill-proj"):
+                q, k, v, k_summary = self.compute.prefill_proj(h, 
                                                             None, position_embed, 
                                                                w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
                                                                (n_qhead, n_kvhead), 
@@ -634,7 +635,8 @@ class QKVProj(TransformerComponent):
         else:
             (tail_k, donate[2]), (tail_v, donate[2]), \
             (summary, donate[2]), (idx_home, idx_cnt)= cache_read_buf.pop()
-            q, k, v, new_summary, idx = self.compute.decode_proj(
+            with torch.profiler.record_function("deocde-proj"):
+                q, k, v, new_summary, idx = self.compute.decode_proj(
                 h, None, position_embed, 
                 w_q, b_q, w_k, b_k, w_v, b_v, w_ln,
                 tail_k, tail_v, summary, (n_qhead, n_kvhead), context_len, 
@@ -760,7 +762,8 @@ class AttentionAfterProj(TransformerComponent):
             (selected_k, donate[1]), (selected_v, donate[2]), \
             (tail_k, donate[3]), (tail_v, donate[4]) = cache_read_buf.pop()
 
-            h = self.compute.gqa_after_proj(q, new_k, new_v, 
+            with torch.profiler.record_function("attn"):
+                h = self.compute.gqa_after_proj(q, new_k, new_v, 
                                             w_o, 
                                             tail_k, tail_v, selected_k, selected_v  )        
 
@@ -832,7 +835,8 @@ class MLP(TransformerComponent):
                 (w_down,    _), 
                 (w_ln,      _)  ) = weight_read_buf.val
 
-        h = self.compute.qwen_mlp(h, w_gate, w_up, w_down, w_ln, donate, self.layer_id)
+        with torch.profiler.record_function("mlp"):
+            h = self.compute.qwen_mlp(h, w_gate, w_up, w_down, w_ln, donate, self.layer_id)
         hidden.val = h
 
         dump_hidden(h.data, "final" , self.layer_id)
@@ -1599,32 +1603,37 @@ class QwenLM:
         self.sync()
 
         # Generate
-        for i in range(self.execute_gen_len):
-            if i % 10 == 0 or 1:
-                catlog(f" >>> step-{i}", "step") 
-            timers("generate").start()
-            for k in range(self.num_gpu_batches):
-                self.update_attention_mask(i, k)
-                self.update_position_embedding(i, k)
-                pass
-            for j in range(self.num_layers):
+
+        with torch.profiler.profile(
+            activities=[    torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA],
+        ) as perf:
+            for i in range(self.execute_gen_len):
+                if i % 10 == 0 or 1:
+                    catlog(f" >>> step-{i}", "step") 
+                timers("generate").start()
                 for k in range(self.num_gpu_batches):
-                    self.store_hidden(i, j, k-1)
-                    self.store_cache(i, j, k-1)
+                    self.update_attention_mask(i, k)
+                    self.update_position_embedding(i, k)
+                    pass
+                for j in range(self.num_layers):
+                    for k in range(self.num_gpu_batches):
+                        self.store_hidden(i, j, k-1)
+                        self.store_cache(i, j, k-1)
 
-                    self.load_weight(i, j+1, k)
-                    self.load_hidden(i, j, k+1)
-                    self.load_cache(i, j, k+1)
+                        self.load_weight(i, j+1, k)
+                        self.load_hidden(i, j, k+1)
+                        self.load_cache(i, j, k+1)
 
-                    self.compute_layer(i, j, k)
-                    self.sync()
+                        self.compute_layer(i, j, k)
+                        self.sync()
 
-                # mem_peak = torch.cuda.max_memory_allocated("cuda")
-                # print(f" >>> mem peak: {mem_peak//10**9} GB")
-            timers("generate").stop()
+                    # mem_peak = torch.cuda.max_memory_allocated("cuda")
+                    # print(f" >>> mem peak: {mem_peak//10**9} GB")
+                timers("generate").stop()
+
+        perf.export_chrome_trace("offload-perf.json")
         # Epilogue
-        # self.store_hidden(
-        #     self.execute_gen_len-1, self.num_layers-1, self.num_gpu_batches-1)
 
     def profile_gen_loop(self):
         with torch.profiler.profile(
@@ -1932,7 +1941,7 @@ def predict_mem_and_log(qwen_config, num_prompts, prompt_len, gen_len):
     cache_size = qwen_config.cache_bytes(num_prompts, context_len)
     hidden_size = qwen_config.hidden_bytes(num_prompts, context_len)
     
-    print(f" >>> genlen: {context_len}, ")
+    print(f" >>> context-len: {context_len}, ")
     print(f"model size: {qwen_config.model_bytes()/GB:.3f} GB, "
     f"cache size: {cache_size/GB:.3f} GB, "
     f"hidden size (prefill): {hidden_size/GB:.3f} GB")
