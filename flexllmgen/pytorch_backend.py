@@ -13,11 +13,14 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+import gc
+
 from flash_attn import flash_attn_func
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes, expand_block_idx, ValueHolder, num_block, 
-    to_cache_home_shape, tail_length, bhsd_to_bsH, bsH_to_bhsd)
+    to_cache_home_shape, tail_length, bhsd_to_bsH, bsH_to_bhsd, 
+    bf16_np_to_torch, bf16_torch_to_np)
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -55,6 +58,13 @@ def dump_hidden(torch_obj, name, layerno=None, seq_len=None):
 def repeat_interleave(kv_data, n_qhead, n_kvhead):
     assert len(kv_data.shape) == 4, f" >>> shape:{kv_data.shape}"
     return torch.repeat_interleave(kv_data, n_qhead//n_kvhead, dim=1)
+ 
+
+def log_gpu_mem(location):
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    
+    print(f" >>> @ {location}, allocated: {allocated} GB, reserved: {reserved} GB")
 
 def check_idx(idx):
     mx = idx.max()
@@ -199,7 +209,7 @@ class TorchTensor:
             assert data.device == device.dev
 
         self.shape = shape
-        self.dtype = dtype
+        self.dtype = dtype              # torch version
         self.data:torch.Tensor= data
         self.device:TorchDevice= device
 
@@ -241,8 +251,10 @@ class TorchTensor:
                 tmp = global_cpu_device.compressed_device.compress(tmp, self.data[2])
                 general_copy(self, None, tmp, None)
             else:   
-                
-                self.data.copy_(torch.from_numpy(np_array))
+                if self.dtype == torch.bfloat16:
+                    self.data.copy_(bf16_np_to_torch(np_array))
+                else:
+                    self.data.copy_(torch.from_numpy(np_array))
 
     def load_from_np_file(self, filename):
         if self.device.device_type == DeviceType.DISK:
@@ -1354,9 +1366,8 @@ class TorchDevice:
             w_gate = w_gate.device.decompress(w_gate)
             w_up = w_up.device.decompress(w_up)
             w_down = w_down.device.decompress(w_down)
-
+        # (b, s, H) -> 8*10000*1000*2 -> 1.4G -> 5.6G
         b, s, h = inputs.shape
-
 
         dump_hidden(inputs.data, "mlp-input", layerno)
 
@@ -1367,11 +1378,19 @@ class TorchDevice:
         gate = F.silu(gate, inplace=True)
         
         up = F.linear(norm, w_up.data, bias=None)
+        
         del norm
 
         # out = gate * up
         out = up.mul_(gate)
+        # log_gpu_mem()
         del gate
+        # log_gpu_mem()
+        torch.cuda.empty_cache()
+        # log_gpu_mem()
+        
+        gc.collect()
+        # norm[:] = F.linear(out, w_down.data, bias=None)
         
         out = F.linear(out, w_down.data, bias=None)
         
