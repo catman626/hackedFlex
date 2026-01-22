@@ -10,13 +10,16 @@ import numpy as np
 import dataclasses
 import argparse
 import tqdm
+import threading
+import time
 
 from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchTensor, dump_hidden, 
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
-    read_benchmark_log, expand_block_idx, num_block, tail_length, cache_slice, check_idx, catlog)
+    read_benchmark_log, expand_block_idx, 
+    num_block, tail_length, cache_slice, check_idx, catlog, profile_tag)
 from flexllmgen.qwen2_config import QwenConfig, get_qwen_config, convert_qwen_weights
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.sparse import SparseConfig
@@ -428,7 +431,7 @@ class QKVProj(TransformerComponent):
             else self.env.gpu)
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
             else self.compute)
-        self.task:Task|None= None
+        self.task:Task= None
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, self.config.dtype)
@@ -726,7 +729,6 @@ class AttentionAfterProj(TransformerComponent):
             
             idx, _= idx_home.smart_copy(k_home.device)
             idx = idx.data
-            # torch.cuda.synchronize()
             # idx = idx.data.to(k_home.device.dev)
             indices = idx[:, :, :idx_cnt]
 
@@ -1168,6 +1170,7 @@ class QwenLM:
         self.load_weight_stream = torch.cuda.Stream()
         self.load_cache_stream = torch.cuda.Stream()
         self.store_cache_stream = torch.cuda.Stream()
+        self.compute_stream = torch.cuda.Stream()
 
         # Intermediate tensors
         # The following buffers store values used
@@ -1260,6 +1263,7 @@ class QwenLM:
     def init_cache(self, j, k):
         self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
 
+    @profile_tag("load-cache")
     def load_cache(self, i, j, k, overlap=True):
         # Handle corner cases
         if i == 0:  # prefill, no cache
@@ -1310,6 +1314,7 @@ class QwenLM:
         self.store_hidden(i, j-1, k)
         self.load_hidden(i, j, k)
 
+    @profile_tag("load-hidden")
     def load_hidden(self, i, j, k):
         # Handle corner cases
         if k == self.num_gpu_batches:
@@ -1337,6 +1342,9 @@ class QwenLM:
             val = self.hidden[i][j-1][k].pop()  #.move(dst)
         self.hidden[i][j][k].store(val)
 
+    
+    
+    @profile_tag("store-hidden")
     def store_hidden(self, i, j, k):
         # Handle corner cases
         if k == -1:
@@ -1366,6 +1374,7 @@ class QwenLM:
         #     if x.val:  # x may already be moved due to overlapping
         #         x.val = x.val.move(self.act_home)
 
+    @profile_tag("compute-layer")
     def compute_layer(self, i, j, k):
         # Update the hidden in place
         # Clear the weight_read_buf if it is the last gpu batch
@@ -1373,6 +1382,8 @@ class QwenLM:
         # Run layer computation
 
         # input/output embed layer
+        # with torch.cuda.stream(self.compute_stream):
+        st = time.time()
         self.layers[j].forward(
                 self.hidden[i][j][k], 
                 self.cache_read_buf[j][k],
@@ -1380,10 +1391,13 @@ class QwenLM:
                 self.attention_mask[k], 
                 self.position_embedding[k], 
                 self.cache_write_buf[j][k], i, k)
+        elapse = time.time() - st
+        print(f" >>> compute_layer elapse: {elapse}")
 
     def sync(self):
-        self.env.disk.synchronize()
-        torch.cuda.synchronize()
+        with torch.profiler.record_function("sync"):
+            self.env.disk.synchronize()
+            torch.cuda.synchronize()
 
     def init_all_weights(self):
         self.weight_home = array_1d(self.num_layers, ValueHolder)
@@ -1602,12 +1616,13 @@ class QwenLM:
         self.load_hidden(0, 0, 0)
         self.sync()
 
-        # Generate
-
+        log_dir = "./logs/perf"
         with torch.profiler.profile(
             activities=[    torch.profiler.ProfilerActivity.CPU,
                             torch.profiler.ProfilerActivity.CUDA],
+            # on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir)
         ) as perf:
+            # Generate
             for i in range(self.execute_gen_len):
                 if i % 10 == 0 or 1:
                     catlog(f" >>> step-{i}", "step") 
@@ -1615,17 +1630,19 @@ class QwenLM:
                 for k in range(self.num_gpu_batches):
                     self.update_attention_mask(i, k)
                     self.update_position_embedding(i, k)
-                    pass
+                    
                 for j in range(self.num_layers):
                     for k in range(self.num_gpu_batches):
+                        self.compute_layer(i, j, k)
                         self.store_hidden(i, j, k-1)
                         self.store_cache(i, j, k-1)
 
                         self.load_weight(i, j+1, k)
                         self.load_hidden(i, j, k+1)
+                        # gather_thread = threading.Thread(target=self.load_cache, args=[ i,j,k+1])
+                        # gather_thread.start()
                         self.load_cache(i, j, k+1)
-
-                        self.compute_layer(i, j, k)
+                        # gather_thread.join()
                         self.sync()
 
                     # mem_peak = torch.cuda.max_memory_allocated("cuda")

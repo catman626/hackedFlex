@@ -20,7 +20,7 @@ from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes, expand_block_idx, ValueHolder, num_block, 
     to_cache_home_shape, tail_length, bhsd_to_bsH, bsH_to_bhsd, 
-    bf16_np_to_torch, bf16_torch_to_np)
+    bf16_np_to_torch, bf16_torch_to_np, profile_tag)
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -138,7 +138,7 @@ def copy_indices_to_shape(indices:Tuple, src_shape):
         print(f" >>> idx type: {type(indices)}")
         raise NotImplementedError()
 
-def advanec_idx(data, idx):
+def advance_idx(data, idx):
     # concat all selected idx all 
     # data: (b, kv_head, s, hidden)
     # idx:  (b, q_head, k)
@@ -172,8 +172,8 @@ def index_into(data:torch.Tensor, idx, ensure_view=False):
     if isinstance(idx, torch.Tensor):
         # only case of block sparse
         assert not ensure_view 
-        with torch.profiler.record_function("gather-idx"):
-            selected = advanec_idx(data, idx)
+        with torch.profiler.record_function("index-into"):
+            selected = advance_idx(data, idx)
 
     elif isinstance(idx, tuple):
         selected = data[idx] 
@@ -600,10 +600,12 @@ class TorchDevice:
             attn_out = bhsd_to_bsH(attn_out)
         else:
             from flexllmgen.sparse import block_sparse_attention
-            attn_out = block_sparse_attention(q, 
-                                              repeat_interleave(k, n_qhead, n_kvhead), 
-                                              repeat_interleave(v, n_qhead, n_kvhead), 
-                                              top_k=s//block_size//10)
+
+            with torch.profiler.record_function("block-sparse-attention"):
+                attn_out = block_sparse_attention(q, 
+                                                repeat_interleave(k, n_qhead, n_kvhead), 
+                                                repeat_interleave(v, n_qhead, n_kvhead), 
+                                                top_k=s//block_size//10)
             # attn_out = q
             attn_out = bhsd_to_bsH(attn_out)
 
@@ -673,7 +675,7 @@ class TorchDevice:
 
             topk = max(num_blk//5, 1)
             # (b, h, k)
-            top_weight, top_idx = torch.topk(blk_attn_score, num_blk // 5, dim=-1, sorted=False)
+            top_weight, top_idx = torch.topk(blk_attn_score, topk, dim=-1, sorted=False)
 
             top_idx = top_idx.squeeze(dim=2)
             idx = expand_block_idx(top_idx, block_size)
@@ -1410,17 +1412,17 @@ class TorchDevice:
         # log_gpu_mem()
         del gate
         # log_gpu_mem()
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         # log_gpu_mem()
         
-        gc.collect()
+        # gc.collect()
         # norm[:] = F.linear(out, w_down.data, bias=None)
         
         out = F.linear(out, w_down.data, bias=None)
         
         out = out.add_(inputs.data)
 
-        if donate[0]: inputs.delete()
+        # if donate[0]: inputs.delete()
         
         return TorchTensor.create_from_torch(out, self)
 
@@ -1788,10 +1790,7 @@ def copy_worker_func(queue, cuda_id):
                     if torch.is_floating_point(src_data) \
                         else cpu_buf_int[:size].view(src_data.shape)
                 tmp_cpu_buf.copy_(src_data)
-                # print(f" >>>>>> tmp_cpu_buf.min().item(): {tmp_cpu_buf.min().item()}")
-                # print(f" >>>>>> src_data.min().item(): {src_data.min().item()}")
                 dst_data.copy_(tmp_cpu_buf)
-                # print(f" >>>>>> dst_data.min().item(): {dst_data.min().item()}")
             else:
                 dst_data.copy_(src_data)
 
