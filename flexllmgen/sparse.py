@@ -191,11 +191,21 @@ def block_sparse_attention(
     key     = torch.nn.functional.pad(key, [0, 0, 0, pad, 0, 0, 0, 0])
     value   = torch.nn.functional.pad(value, [0, 0, 0, pad, 0, 0, 0, 0])
 
-    seqlens = torch.tensor([context_size], dtype=torch.int32, device=query.device)
-    sm_scale = head_dim ** -0.5
-    block_index = _build_block_index(query, key, top_k, block_size_N, block_size_N)
+    
+    with torch.profiler.record_function("make-seqlens-0"):
+        # seqlens = torch.tensor([context_size], dtype=torch.int32, device=query.device)
+        seqlens = torch.empty(1, dtype=torch.int32, device=query.device)
+    
+    with torch.profiler.record_function("make-seqlens1"):
+        seqlens[:] = context_size
 
-    out = _triton_block_sparse_attention(query, key, value, seqlens, block_index, sm_scale, block_size_M, block_size_N)
+    sm_scale = head_dim ** -0.5
+    
+    with torch.profiler.record_function("build-block-idx"):
+        block_index = _build_block_index(query, key, top_k, block_size_N, block_size_N)
+
+    with torch.profiler.record_function("triton-block-sparse-attention"):
+        out = _triton_block_sparse_attention(query, key, value, seqlens, block_index, sm_scale, block_size_M, block_size_N)
     return out[..., :context_size, :]
     
 def naive_attn(q:torch.Tensor, k:torch.Tensor, v:torch.Tensor):

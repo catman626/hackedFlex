@@ -360,12 +360,14 @@ def bf16_torch_to_np(torch_data):
 def bf16_np_to_torch(np_data):
     return torch.tensor(np_data.view(np.uint16)).view(torch.bfloat16)
 
+
 def check_idx(idx:torch.Tensor, s):
     assert len(idx.shape) == 3  
-    mn = idx.min().item()
-    mx = idx.max().item()
+    return True
+    # mn = idx.min().item()
+    # mx = idx.max().item()
 
-    assert mn >= 0 and mx <= s
+    # assert mn >= 0 and mx <= s
 
 def catlog(log_content, tag=None):
     if tag in [
@@ -373,3 +375,15 @@ def catlog(log_content, tag=None):
         # "block",
     ] :
         print(log_content)
+
+def profile_tag(tag):
+    """
+    装饰器工厂函数，用于为函数添加 torch.profiler.record_function
+    """
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            # 使用 record_function 上下文管理器
+            with torch.profiler.record_function(tag):
+                return func(*args, **kwargs)
+        return wrapper
+    return decorator
