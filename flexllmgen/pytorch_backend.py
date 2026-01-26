@@ -1430,10 +1430,18 @@ class TorchDevice:
 
         out = up.mul_(gate)
         del gate
+        # log_gpu_mem()
+        # torch.cuda.empty_cache()
+        # log_gpu_mem()
+        
+        # gc.collect()
+        # norm[:] = F.linear(out, w_down.data, bias=None)
         
         out = F.linear(out, w_down.data, bias=None)
         
-        mlp_out = out.add_(inputs.data)
+        out = out.add_(inputs.data)
+
+        # if donate[0]: inputs.delete()
         
         return TorchTensor.create_from_torch(mlp_out, self)
 
