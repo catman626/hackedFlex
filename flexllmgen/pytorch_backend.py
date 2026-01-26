@@ -32,6 +32,28 @@ DUMP_VERBOSE = False
 
 sparse_block_summary: torch.Tensor
 
+@torch.compile(mode="reduce-overhead", fullgraph=True) # 你可以根据需要调整 mode
+def compiled_mlp(norm_data, w_gate_data, w_up_data, w_down_data, inputs_data):
+    # 这里的 norm_data, w_gate_data 等都是 torch.Tensor
+    # 执行计算
+    gate = F.linear(norm_data, w_gate_data, bias=None)
+    gate = F.silu(gate, inplace=True) # 原地 SiLU
+    
+    up = F.linear(norm_data, w_up_data, bias=None)
+    
+    # mul_ 是原地操作，直接修改 up
+    up.mul_(gate)
+    # 此时 gate 可以被释放，但在编译图中由编译器管理
+    
+    out = F.linear(up, w_down_data, bias=None)
+    
+    # add_ 是原地操作，直接加到 inputs_data 上
+    # 注意：这会修改 inputs_data！如果你不希望修改原始 inputs，请使用 out + inputs_data
+    out.add_(inputs_data)
+    
+    return out
+
+
 def dump_hidden(torch_obj, name, layerno=None, seq_len=None):
     global DUMP_HIDDEN, DUMP_VERBOSE
     if DUMP_HIDDEN == False:
@@ -1387,44 +1409,33 @@ class TorchDevice:
         return TorchTensor.create_from_torch(out, self)
 
     def qwen_mlp(self, inputs, w_gate, w_up, w_down, w_ln, donate, layerno):
-        # decompress weights
-        if w_gate.device.device_type == DeviceType.COMPRESSED:
-            w_gate = w_gate.device.decompress(w_gate)
-            w_up = w_up.device.decompress(w_up)
-            w_down = w_down.device.decompress(w_down)
+        # # decompress weights
+        # if w_gate.device.device_type == DeviceType.COMPRESSED:
+        #     w_gate = w_gate.device.decompress(w_gate)
+        #     w_up = w_up.device.decompress(w_up)
+        #     w_down = w_down.device.decompress(w_down)
         # (b, s, H) -> 8*10000*1000*2 -> 1.4G -> 5.6G
-        b, s, h = inputs.shape
 
-        dump_hidden(inputs.data, "mlp-input", layerno)
+        # dump_hidden(inputs.data, "mlp-input", layerno)
 
         norm = rms_layernorm(inputs.data, w_ln.data)
 
+        # mlp_out = compiled_mlp(norm, w_gate.data, w_up.data, w_down.data, inputs.data)
         gate = F.linear(norm, w_gate.data, bias=None)
-
         gate = F.silu(gate, inplace=True)
         
         up = F.linear(norm, w_up.data, bias=None)
         
         del norm
 
-        # out = gate * up
         out = up.mul_(gate)
-        # log_gpu_mem()
         del gate
-        # log_gpu_mem()
-        # torch.cuda.empty_cache()
-        # log_gpu_mem()
-        
-        # gc.collect()
-        # norm[:] = F.linear(out, w_down.data, bias=None)
         
         out = F.linear(out, w_down.data, bias=None)
         
-        out = out.add_(inputs.data)
-
-        # if donate[0]: inputs.delete()
+        mlp_out = out.add_(inputs.data)
         
-        return TorchTensor.create_from_torch(out, self)
+        return TorchTensor.create_from_torch(mlp_out, self)
 
     def synchronize(self):
         torch.cuda.synchronize()
@@ -1672,6 +1683,7 @@ class TorchLink:
         return size / bandwidth
 
 
+@profile_tag("general-copy")
 def general_copy(dst: TorchTensor, dst_indices: Tuple,
                  src: TorchTensor, src_indices: Tuple):
     """Launch a general asynchronous copy between two tensors.

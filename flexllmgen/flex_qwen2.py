@@ -1392,7 +1392,7 @@ class QwenLM:
                 self.position_embedding[k], 
                 self.cache_write_buf[j][k], i, k)
         elapse = time.time() - st
-        print(f" >>> compute_layer elapse: {elapse}")
+        print(f" >>> compute_layer elapse: {elapse*1000:3f}ms")
 
     def sync(self):
         with torch.profiler.record_function("sync"):
@@ -2027,7 +2027,7 @@ def run_flexllmgen(args):
     total_latency = prefill_latency + decode_latency
     total_throughput = num_generated_tokens / total_latency
     _, gpu_peak_mem = env.gpu.mem_stats()
-    _, cpu_peak_mem = env.cpu.mem_stats()
+    # _, cpu_peak_mem = env.cpu.mem_stats()
     
 
     if DUMMY_WEIGHT not in args.path:
