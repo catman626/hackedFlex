@@ -16,6 +16,7 @@ import numpy as np
 import gc
 
 from flash_attn import flash_attn_func
+from flexllmgen.sparse import block_sparse_attention
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes, expand_block_idx, ValueHolder, num_block, 
@@ -81,6 +82,8 @@ def repeat_interleave(kv_data, n_qhead, n_kvhead):
     assert len(kv_data.shape) == 4, f" >>> shape:{kv_data.shape}"
     return torch.repeat_interleave(kv_data, n_qhead//n_kvhead, dim=1)
  
+def torch_qwen_mlp(inputs, w_gate, w_up, w_down, w_ln):
+    pass
 
 def log_gpu_mem(location):
     allocated = torch.cuda.memory_allocated() / 1024**3
@@ -544,7 +547,7 @@ class TorchDevice:
         head_dim = hidden_size // n_qhead
         shape = (gpu_batch_size, n_kvhead, prompt_len + gen_len - 1, head_dim)
 
-        pin_memory = False
+        pin_memory = True
         k_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
         v_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
 
@@ -593,7 +596,7 @@ class TorchDevice:
 
     def prefill_proj(self, h, attn_mask, position_embed, 
                          w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
-                         n_head, enable_sparse=False, block_size=0):
+                         n_head, sparsity, block_size=0):
         """ return q:(bsH)"""
         assert len(h.shape) == 3
         b, s, hidden_dim = h.shape
@@ -612,7 +615,7 @@ class TorchDevice:
                                  w_v.data, b_v.data, w_ln.data,
                                  n_head)
         
-        if not enable_sparse:
+        if sparsity >= 1:
             attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
             assert attn_out.dtype == torch.bfloat16
 
@@ -621,8 +624,7 @@ class TorchDevice:
             # bhsd -> bshd -> bsH
             attn_out = bhsd_to_bsH(attn_out)
         else:
-            from flexllmgen.sparse import block_sparse_attention
-
+            topk = s // block_size * sparsity
             with torch.profiler.record_function("block-sparse-attention"):
                 attn_out = block_sparse_attention(q, 
                                                 repeat_interleave(k, n_qhead, n_kvhead), 
@@ -647,9 +649,10 @@ class TorchDevice:
                         h, attn_mask, position_embed, 
                         w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
                         tail_k, tail_v, k_summary,
-                        n_head, context_len, enable_sparse=False, block_size=None):
+                        n_head, context_len, sparsity, block_size=None):
         """ k_summary: (b, h, blk, d) """
-        head_dim = h.shape[-1]
+        # head_dim = h.shape[-1]
+        n_qhead, n_kvhead = n_head
         cos = position_embed.data[0][context_len-1:context_len]
         sin = position_embed.data[1][context_len-1:context_len]
 
@@ -658,7 +661,7 @@ class TorchDevice:
                                  w_q.data, b_q.data, w_k.data, b_k.data, w_v.data, b_v.data, w_ln.data,
                                  n_head)
         # get idx
-        if not enable_sparse:
+        if sparsity >= 1:
             # use q for return value 
             # q = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
             # q = bhsd_to_bsH(q)
@@ -695,11 +698,22 @@ class TorchDevice:
 
             blk_attn_score = self._gqa_attn_weights(q, summary, mask=None)
 
-            topk = max(num_blk//5, 1)
+            topk = max(int(num_blk*sparsity), 1)
             # (b, h, k)
             top_weight, top_idx = torch.topk(blk_attn_score, topk, dim=-1, sorted=False)
+            
+            # group_size = n_qhead // n_kvhead
+            # group_selections = []
+            # for bid in range(b):
+            #     for kh in range(n_kvhead):
+            #         group_selection = torch.unique(top_idx[bid, kh*group_size:(kh+1)*group_size, :] )
+            #         group_selections.append(group_selection)
+            
+            
+            
 
             top_idx = top_idx.squeeze(dim=2)
+
             idx = expand_block_idx(top_idx, block_size)
 
             check_idx(idx)
@@ -1417,6 +1431,8 @@ class TorchDevice:
         # (b, s, H) -> 8*10000*1000*2 -> 1.4G -> 5.6G
 
         # dump_hidden(inputs.data, "mlp-input", layerno)
+        
+        # mlp_out = torch_qwen_mlp(inputs.data, w_gate.data, w_up.date, w_down.data, w_ln.data)
 
         norm = rms_layernorm(inputs.data, w_ln.data)
 
@@ -1439,7 +1455,7 @@ class TorchDevice:
         
         out = F.linear(out, w_down.data, bias=None)
         
-        out = out.add_(inputs.data)
+        mlp_out = out.add_(inputs.data)
 
         # if donate[0]: inputs.delete()
         

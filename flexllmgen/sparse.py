@@ -5,7 +5,7 @@ class SparseConfig:
     """ sparse config"""
     mode: str
     block_size: int = 64
-    sparsity: float = 0.6
+    sparsity: float = 0.05
 
 # Copyright (c) 2024 Microsoft
 # Licensed under The MIT License [see LICENSE for details]

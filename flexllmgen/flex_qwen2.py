@@ -425,7 +425,7 @@ class QKVProj(TransformerComponent):
         self.config : QwenConfig = config
         self.env = env
         self.layer_id = layer_id
-        self.policy = policy
+        self.policy:Policy = policy
         self.compute:TorchDevice= self.env.gpu
         self.attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
             else self.env.gpu)
@@ -627,23 +627,27 @@ class QKVProj(TransformerComponent):
 
         if i == 0:
             with torch.profiler.record_function("prefill-proj"):
+                sparsity = self.policy.sparse_config.sparsity if self._sparse_stage(i) \
+                    else 1
                 q, k, v, k_summary = self.compute.prefill_proj(h, 
                                                             None, position_embed, 
                                                                w_q, b_q, w_k, b_k, w_v, b_v, w_ln, 
                                                                (n_qhead, n_kvhead), 
-                                                               enable_sparse=self._sparse_stage(i), 
+                                                               sparsity,
                                                                block_size=block_size)
             cache_write_buf.store((k, v, k_summary))
             hidden.val = q
         else:
             (tail_k, donate[2]), (tail_v, donate[2]), \
             (summary, donate[2]), (idx_home, idx_cnt)= cache_read_buf.pop()
+            sparsity = self.policy.sparse_config.sparsity if self._sparse_stage(i) else 1
             with torch.profiler.record_function("deocde-proj"):
                 q, k, v, new_summary, idx = self.compute.decode_proj(
                 h, None, position_embed, 
                 w_q, b_q, w_k, b_k, w_v, b_v, w_ln,
                 tail_k, tail_v, summary, (n_qhead, n_kvhead), context_len, 
-                enable_sparse=self._sparse_stage(i),block_size=block_size)
+                sparsity,
+                block_size=block_size)
             
             hidden.val = (q, k, v)
             
